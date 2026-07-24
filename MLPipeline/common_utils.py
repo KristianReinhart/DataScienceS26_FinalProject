@@ -40,7 +40,7 @@ warnings.filterwarnings("ignore")
 
 # CONFIG
 CONFIG = {
-    "debug_mode": True,
+    "debug_mode": False,
 
     "reference_cohort_dir": "reference_cohort", #from 00_build_reference_cohort
     "results_dir": "results",
