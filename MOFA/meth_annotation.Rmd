@@ -9,7 +9,10 @@ output: html_document
 
 ## R Markdown
 ```{r Working directory}
-setwd("D:/Uni/Master/Data Science/Project/Code_local/MOFA")
+# Working directory: this file expects to run from the MOFA/ folder.
+# knitr sets this automatically when knitting. Uncomment and edit only if you
+# run the chunks interactively from a different location.
+# setwd("path/to/MOFA")
 ```
 
 MOFA Methylation Annotation + Enrichment Analysis Pipeline:
