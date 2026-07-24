@@ -1,0 +1,63 @@
+"Factor","ONTOLOGY","TERM","N","DE","P.DE","FDR"
+"Factor_2","CC","cytoskeleton",525,80,1.60730492250307e-07,0.0024058140080026
+"Factor_4","BP","multicellular organism development",1103,133,1.15186723946723e-07,0.00112014377401612
+"Factor_4","BP","anatomical structure morphogenesis",687,88,2.26096003208097e-05,0.0483457853716971
+"Factor_4","BP","tissue development",475,66,1.05750307553593e-05,0.0263811767243696
+"Factor_4","BP","developmental process",1451,158,6.72842546271772e-07,0.00201422144651918
+"Factor_4","BP","animal organ development",698,93,4.40677345073486e-07,0.00164901462526498
+"Factor_4","BP","system development",965,120,1.78569861478453e-07,0.00112014377401612
+"Factor_4","BP","anatomical structure development",1355,152,2.24507704572979e-07,0.00112014377401612
+"Factor_7","CC","cornified envelope",9,7,5.3597681106388e-08,5.73035779143154e-05
+"Factor_7","MF","transmembrane signaling receptor activity",178,36,9.35932285334109e-11,1.16741953724008e-07
+"Factor_7","MF","G protein-coupled receptor activity",87,23,9.86506584244021e-10,1.13584850407419e-06
+"Factor_7","MF","olfactory receptor activity",19,15,2.39799318479955e-15,3.58931619900796e-11
+"Factor_7","MF","monoatomic ion channel activity",89,17,3.47474368730621e-05,0.0133358880798972
+"Factor_7","MF","extracellular ligand-gated monoatomic ion channel activity",13,6,0.000115360388174195,0.0338571429449284
+"Factor_7","MF","odorant binding",9,7,1.83809612418756e-07,0.000183417485245596
+"Factor_7","CC","plasma membrane",1126,102,2.87677980745406e-07,0.000269122750987327
+"Factor_7","BP","monoatomic ion transport",271,36,3.773889189032e-06,0.00220510542064931
+"Factor_7","BP","humoral immune response",41,11,1.67507317571649e-05,0.00790738090302933
+"Factor_7","BP","G protein-coupled receptor signaling pathway",174,26,1.37853241774545e-05,0.00687795774293797
+"Factor_7","BP","sensory perception",116,22,1.51015002667021e-06,0.00118968029469472
+"Factor_7","BP","sensory perception of chemical stimulus",30,16,3.84960048285955e-12,7.20260250343023e-09
+"Factor_7","BP","sensory perception of smell",25,16,6.43621771785322e-14,1.92674613601654e-10
+"Factor_7","CC","voltage-gated potassium channel complex",21,8,4.77997589110966e-05,0.0178866697845323
+"Factor_7","BP","epidermis development",75,14,0.000140157118335741,0.039582485797158
+"Factor_7","BP","detection of chemical stimulus",29,17,4.47217082841132e-14,1.67348632399152e-10
+"Factor_7","BP","response to biotic stimulus",279,32,0.000132665264307371,0.0381871860798602
+"Factor_7","BP","epidermal cell differentiation",46,13,2.31685311557161e-06,0.00173393287169379
+"Factor_7","BP","regulation of metal ion transport",95,17,2.97032205693468e-05,0.0121595039813953
+"Factor_7","MF","channel activity",96,17,8.5199406886254e-05,0.0283392160505211
+"Factor_7","BP","peptide cross-linking",6,4,0.000151523843820085,0.0420001647092414
+"Factor_7","BP","antimicrobial humoral response",18,8,3.21560810058407e-06,0.00206938820830359
+"Factor_7","MF","passive transmembrane transporter activity",97,17,9.66779734120914e-05,0.0307888490645145
+"Factor_7","MF","transmitter-gated monoatomic ion channel activity",13,6,0.000115360388174195,0.0338571429449284
+"Factor_7","MF","transmitter-gated channel activity",13,6,0.000115360388174195,0.0338571429449284
+"Factor_7","BP","keratinocyte differentiation",36,12,7.67718957728574e-07,0.000675953962310664
+"Factor_7","MF","neurotransmitter receptor activity",18,7,8.7190039777904e-05,0.028370880769471
+"Factor_7","BP","keratinization",14,11,1.02756234995672e-11,1.53805532541522e-08
+"Factor_7","BP","killing of cells of another organism",7,5,1.74334293025099e-05,0.00790738090302933
+"Factor_7","BP","monoatomic ion transmembrane transport",223,32,2.59964762414505e-06,0.00185292979229539
+"Factor_7","CC","monoatomic ion channel complex",68,16,2.98342840712137e-06,0.00202981619989967
+"Factor_7","CC","potassium channel complex",23,8,0.000106061104602184,0.0330733877851144
+"Factor_7","MF","signaling receptor activity",226,44,2.31938051893136e-12,4.95949822962351e-09
+"Factor_7","BP","defense response to bacterium",39,11,8.88989947868551e-06,0.00475228626417731
+"Factor_7","BP","response to external biotic stimulus",271,32,7.62938493250161e-05,0.0265573566673684
+"Factor_7","BP","regulation of monoatomic ion transport",132,21,2.90369270792356e-05,0.0121595039813953
+"Factor_7","BP","nervous system process",243,35,1.49200726738453e-06,0.00118968029469472
+"Factor_7","BP","detection of stimulus involved in sensory perception",31,16,8.55071184268345e-12,1.42207838734762e-08
+"Factor_7","BP","detection of chemical stimulus involved in sensory perception",21,15,3.37488188359385e-14,1.67348632399152e-10
+"Factor_7","BP","detection of chemical stimulus involved in sensory perception of smell",20,15,8.89210660522798e-15,6.65485258335262e-11
+"Factor_7","BP","detection of stimulus",54,20,1.53062019130691e-11,2.08275663849834e-08
+"Factor_7","BP","response to other organism",270,32,6.97269148913344e-05,0.0248493443355594
+"Factor_7","MF","molecular transducer activity",226,44,2.31938051893136e-12,4.95949822962351e-09
+"Factor_7","CC","cell periphery",1226,104,9.46795068077241e-06,0.00488676847551039
+"Factor_7","BP","defense response to other organism",214,30,3.83035415131495e-06,0.00220510542064931
+"Factor_7","BP","inorganic ion transmembrane transport",194,26,8.0302614279623e-05,0.0273174893303954
+"Factor_7","MF","postsynaptic neurotransmitter receptor activity",12,7,3.31809974607738e-06,0.00206938820830359
+"Factor_7","MF","neurotransmitter receptor activity involved in regulation of postsynaptic membrane potential",11,6,3.08699326091008e-05,0.0121595039813953
+"Factor_7","BP","disruption of anatomical structure in another organism",10,6,6.62141412876227e-06,0.00367071580293754
+"Factor_7","BP","disruption of cell in another organism",7,5,1.74334293025099e-05,0.00790738090302933
+"Factor_7","CC","transmembrane transporter complex",81,16,2.33609567788027e-05,0.0102843176783859
+"Factor_7","MF","transmitter-gated monoatomic ion channel activity involved in regulation of postsynaptic membrane potential",11,6,3.08699326091008e-05,0.0121595039813953
+"Factor_7","CC","transporter complex",87,16,5.8273125346052e-05,0.0212739546385294
