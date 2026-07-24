@@ -92,9 +92,9 @@ required only for the ML pipeline.
 The full download is roughly **2.7 GB**. The methylation matrix alone is ~1.4 GB and needs
 about 3–4 GB of RAM to load. Expect the following approximate runtimes:
 
-| Stage | Runtime |
+| Stage | Runtime (estimated) |
 |---|---|
-| 00 Download | 10–20 min (network dependent) |
+| 00 Download | 5–20 min (network dependent) |
 | 01 QC | 3–5 min |
 | 02 EDA | 5–10 min (methylation load dominates) |
 | 03 DGE | 2–4 min |
@@ -128,12 +128,12 @@ the Rmd files) that you must edit before running. See §7 for the exact values.
 
 ## 4. Reproduction order
 
-Run the stages strictly in this order. Later stages consume files produced by earlier ones.
+Run the stages strictly in this order. Later stages may need files produced by earlier ones.
 
 | Step | File | Produces |
 |---|---|---|
 | 1 | `00_Dataset_Download_KIRC.Rmd` | `TCGA-KIRC/` with 9 data files |
-| 2 | `01_QC.Rmd` | QC report (HTML/PDF) |
+| 2 | `01_QC.Rmd` | QC report |
 | 3 | `02_EDA_KIRC.Rmd` | EDA report |
 | 4 | `03_DGE_KIRC.Rmd` | DGE report + `DGE_tumor_vs_normal_limma.csv` |
 | 5 | `MOFA/MOFA_preperation_and_training.ipynb` | filtered methylation + trained model (`.hdf5`) |
@@ -155,7 +155,7 @@ parallel — **except** that step 13 needs the factor matrix from step 6.
 
 ## 5. Stage details
 
-### Stage 0–3: R Markdown analyses
+### Stage 0–3: R notebook analyses
 
 Open the project in RStudio, set the working directory to the repository root, and knit each
 file in order (`Knit` button, or `rmarkdown::render("02_EDA_KIRC.Rmd")`).
@@ -166,8 +166,9 @@ file in order (`Knit` button, or `rmarkdown::render("02_EDA_KIRC.Rmd")`).
   `Gistic2_CopyNumber_Gistic2_all_data_by_genes.txt` and
   `..._all_thresholded.by_genes.txt` (copy number), `KIRC_mc3_gene_level.txt` (mutations),
   `RPPA.txt` (protein), `KIRC_clinicalMatrix.txt` (phenotypes) and `KIRC_survival.txt`
-  (curated survival). Downloads have a 10-minute timeout each and fail gracefully with a
-  warning, so check the console output before continuing.
+  (curated survival). Downloads have a 10-minute timeout each and fail with a
+  warning, so check the console output or the TCGA-KIRC subdirectory for 9 extracted .txt files
+  before continuing.
 - **`01_QC.Rmd`** produces per-layer quality control for all eight layers.
 - **`02_EDA_KIRC.Rmd`** covers sample inventory and cross-layer overlap, per-layer QC,
   clinical and survival description, removal of a sex-driven technical axis in the methylation
@@ -251,7 +252,7 @@ browser is enough. The notebooks resolve everything from there:
 - `MOFA/*` reads the raw data through `../TCGA-KIRC/` and writes `data/` and `mofa_plots/`
   inside `MOFA/`.
 
-**Knit the R Markdown files from their own folder** as well. The four numbered files at the
+**Knit the R notebook files from their own folder** as well. The four numbered files at the
 repository root resolve data through their `data_dir: "TCGA-KIRC"` parameter. The three
 annotation files in `MOFA/` contain a commented-out `setwd()` line; knitr sets the working
 directory automatically when knitting, so uncomment it only if you execute chunks
@@ -261,7 +262,7 @@ interactively from a different location.
 switch, and notebooks `01`–`04` set it explicitly at the top. It is `False` everywhere, which
 is the full-scale configuration used to produce the reported results. Setting it to `True`
 subsamples to 60 samples, 200 features, 20 trees and 3 folds; that is useful for a quick
-smoke test but does not reproduce the results. If you use it, set it consistently across
+test but does not reproduce the results. If you use it, set it consistently across
 notebooks `01`, `02` and `03`, otherwise the three representations are no longer compared on
 equal terms.
 
@@ -301,5 +302,5 @@ No access restrictions apply; all data is public.
 
 Group 7 — Maksim Danilchyk, Sofya Shorzhina, Tilo Alves Radtke, Kristian Reinhart.
 
-This README consolidates and supersedes the earlier `_README.txt`, `MOFA/README.txt` and
+This README consolidates and supersedes the earlier `MOFA/README.txt` and
 `MLPipeline/README_ML.md`, which are retained for reference.
