@@ -239,9 +239,6 @@ results remain readable without rerunning them.
 
 ## 7. Running the notebooks: working directories
 
-All paths in the code are now **relative**, so no editing is required. The only rule is where
-you start each notebook.
-
 **Start every Jupyter notebook from the folder it lives in.** JupyterLab starts the kernel in
 the notebook's own directory, so opening `MLPipeline/01_model_expression.ipynb` from the file
 browser is enough. The notebooks resolve everything from there:
