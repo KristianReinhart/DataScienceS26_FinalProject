@@ -1,0 +1,660 @@
+---
+title: "Differential Gene Expression — TCGA-KIRC (Tumour vs. Normal)"
+subtitle: "Multi-Omics Integration for Survival Prediction in Clear Cell Renal Cell Carcinoma"
+author: "Project Group 7 — Danilchyk, Shorzhina, Alves Radtke, Reinhart"
+date: "`r format(Sys.Date(), '%d %B %Y')`"
+output:
+  pdf_document:
+    toc: true
+    toc_depth: '3'
+    latex_engine: xelatex
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    theme: flatly
+    highlight: tango
+    code_folding: show
+    fig_width: 10
+    fig_height: 6
+    df_print: paged
+params:
+  data_dir: "TCGA-KIRC"
+  lfc: 1.0             # |log2 fold-change| threshold for "significant"
+  fdr: 0.05           # Benjamini-Hochberg FDR threshold
+  min_detect_frac: 0.20  # keep genes expressed (>0) in at least this fraction of samples
+  n_label: 15         # genes labelled on the volcano (each direction)
+  n_heatmap: 50       # top genes shown in the heatmap
+  seed: 42
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = knitr::is_html_output(),      # foldable code in HTML, hidden in the PDF report
+  warning = FALSE, message = FALSE,
+  cache = TRUE, cache.lazy = FALSE, autodep = TRUE,
+  fig.width = 8, fig.height = 5, fig.align = "center", dpi = 120,
+  out.width = "100%"
+)
+set.seed(params$seed)
+```
+
+# Introduction
+
+This is **Step 2** of the pipeline (after the EDA notebook): A differential gene-expression (DGE) analysis contrasting **primary tumour vs. adjacent normal kidney** on the TCGA-KIRC RNA-seq layer. Its purpose is twofold:
+
+1. **Biological validation** - confirm the cohort reproduces the well-established ccRCC transcriptional signature (e.g. hypoxia/HIF targets up, normal-tubule genes down). This grounds the later, survival-focused analyses in known tumour-vs-normal signal.
+2. **Feature grounding** - the ranked gene list and the tumour-vs-normal signature feed interpretation of the MOFA factors and the survival models downstream.
+
+The Xena RNA-seq matrix is **`log2(RSEM normalized_count + 1)`** - already normalised, continuous values. The correct tool for continuous log-expression is **`limma`** with an empirical-Bayes moderated *t*-test; we enable `trend = TRUE` (mean–variance trend, appropriate for log-count data) and `robust = TRUE` (robust to outlier genes).
+```{r libraries}
+suppressPackageStartupMessages({
+  library(data.table)
+  library(matrixStats)
+  library(limma)          # moderated t-test for log-expression
+  library(survival)       # univariate Cox bridge to survival
+  library(pheatmap)       # heatmap of top DE genes
+  library(ggrepel)        # volcano labels
+  library(patchwork)
+  library(RColorBrewer)
+  library(clusterProfiler)  # GO over-representation
+  library(org.Hs.eg.db)     # gene annotation
+  library(fgsea)            # GSEA on ranked list
+  library(msigdbr)          # Hallmark gene sets
+  library(tidyverse)        # LAST (dplyr on top)
+})
+
+# clusterProfiler / AnnotationDbi export S4 generics (select, filter, rename, slice,
+# count, ...) that can shadow dplyr's under knitr's cached package loading. Pinning them
+# into the global environment (searched first) makes the notebook independent of load order.
+select    <- dplyr::select
+filter    <- dplyr::filter
+rename    <- dplyr::rename
+slice     <- dplyr::slice
+count     <- dplyr::count
+arrange   <- dplyr::arrange
+mutate    <- dplyr::mutate
+summarise <- dplyr::summarise
+desc      <- dplyr::desc
+
+DATA <- params$data_dir
+path <- function(...) file.path(DATA, ...)
+stopifnot(dir.exists(DATA))
+type_cols <- c("Tumor" = "#D7301F", "Normal" = "#2171B5")
+```
+
+```{r helpers}
+# Same barcode/loader helpers as the EDA notebook.
+parse_barcode <- function(x) {
+  parts <- str_split_fixed(x, "-", 4)
+  code  <- substr(parts[, 4], 1, 2)
+  type  <- dplyr::case_when(code == "01" ~ "Tumor",
+                            code == "11" ~ "Normal",
+                            code == "05" ~ "AddlPrimary",
+                            TRUE ~ "Other")
+  tibble(sample = x,
+         patient = paste(parts[, 1], parts[, 2], parts[, 3], sep = "-"),
+         type_code = code, sample_type = type)
+}
+load_matrix <- function(file) {
+  dt <- fread(file, sep = "\t", header = TRUE, showProgress = FALSE)
+  ids <- dt[[1]]; m <- as.matrix(dt[, -1]); rownames(m) <- ids
+  storage.mode(m) <- "double"; m
+}
+```
+
+# Data and experimental design
+
+```{r load}
+rna <- load_matrix(path("HiSeqV2.txt"))
+bc  <- parse_barcode(colnames(rna))
+
+# Two-group comparison: tumour vs solid-tissue normal (11). The tumour group is primary
+# tumour (01) plus the single Additional-New-Primary (05) sample, which we treat as a
+# tumour (it is malignant tissue). Its patient (TCGA-DV-A4W0) also has an 01 sample,
+# so that patient contributes two tumours, so it's a negligible pseudoreplication (1 of 534).
+bc$sample_type[bc$sample_type == "AddlPrimary"] <- "Tumor"
+keep_samp   <- bc$sample_type %in% c("Tumor", "Normal")
+rna         <- rna[, keep_samp]
+group_info  <- bc[keep_samp, ]
+group       <- factor(group_info$sample_type, levels = c("Normal", "Tumor"))
+
+# Patient sex (used as a model covariate, see below).
+pheno <- fread(path("KIRC_clinicalMatrix.txt"), sep = "\t", header = TRUE, na.strings = c("", "NA"))
+sex   <- factor(setNames(pheno$gender, pheno$sampleID)[colnames(rna)])
+
+knitr::kable(
+  as.data.frame(table(group), stringsAsFactors = FALSE) |>
+    setNames(c("group", "n_samples")),
+  caption = "Samples entering the DGE analysis."
+)
+```
+
+## Note: sex is a covariate, and the contrast is confounded with composition
+
+Two design points that shape how the results must be read:
+
+- **Sex is unbalanced between the groups** (below), and unadjusted this leaks sex-linked genes (XIST, Y-chromosome genes) into the "DE" list. We therefore fit **sex as a covariate** so the tumour-vs-normal contrast is adjusted for it. Sex is recorded for all samples, so no data is lost.
+- **The contrast is confounded with cell-type composition.** Adjacent "normal" is almost pure kidney epithelium, whereas the tumour is malignant cells **plus infiltrating immune and stromal cells**. A substantial part of the "immune-response *up* / kidney-development *down*" signal is therefore **compositional** (immune cells are *present* in tumours; normal tubule cells are *absent*), not necessarily a per-cell transcriptional change. Fully separating intrinsic from compositional signal would require cell-type deconvolution or single-cell data; here we simply flag it so the enrichment is not over-interpreted.
+
+```{r sex-balance}
+knitr::kable(as.data.frame.matrix(table(group, sex)),
+             caption = "Sex composition per group (motivates adjusting for sex).")
+```
+
+## Gene filtering
+
+We drop genes that are effectively unexpressed (detected in fewer than
+`r 100 * params$min_detect_frac` % of samples). Low-expression genes carry little signal and
+inflate multiple-testing correction.
+
+```{r gene-filter}
+detect_frac <- rowMeans(rna > 0)
+keep_gene   <- detect_frac >= params$min_detect_frac
+expr        <- rna[keep_gene, ]
+cat(sprintf("Genes: %d kept of %d (detected in >= %.0f%% of samples).\n",
+            nrow(expr), nrow(rna), 100 * params$min_detect_frac))
+```
+
+# Differential expression (limma)
+
+The model is `~ sex + group`; the coefficient of interest is the **tumour-vs-normal effect
+adjusted for sex** (`groupTumor`).
+
+```{r limma-fit}
+design <- model.matrix(~ sex + group)     # adjust for sex; groupTumor = tumour effect
+fit <- lmFit(expr, design)
+fit <- eBayes(fit, trend = TRUE, robust = TRUE)
+
+# Per-group means. `AveExpr` alone is misleading for on/off genes: e.g. SEMG2 is
+# expressed in ~all normals (mean ~4.3) but silenced in the 534 tumours (~0.1), so its
+# AveExpr (~0.6) looks like "low expression" when it is actually a clean marker. The
+# per-group means keep the magnitude and direction honest.
+mean_normal <- rowMeans(expr[, group == "Normal", drop = FALSE])
+mean_tumor  <- rowMeans(expr[, group == "Tumor",  drop = FALSE])
+
+res <- topTable(fit, coef = "groupTumor", number = Inf, sort.by = "P") |>
+  rownames_to_column("gene") |>
+  as_tibble() |>
+  mutate(
+    meanNormal = mean_normal[gene],
+    meanTumor  = mean_tumor[gene],
+    direction = case_when(
+      adj.P.Val < params$fdr & logFC >=  params$lfc ~ "Up in tumour",
+      adj.P.Val < params$fdr & logFC <= -params$lfc ~ "Down in tumour",
+      TRUE ~ "n.s."
+    )
+  )
+
+summary_tab <- res |> count(direction, name = "n_genes")
+knitr::kable(summary_tab,
+             caption = sprintf("DE gene counts (|log2FC| >= %.1f, FDR < %.2f).",
+                               params$lfc, params$fdr))
+```
+
+### Significance is saturated: effect size does the real filtering
+
+With 534 vs 72 samples, statistical power is enormous: essentially every gene reaches a tiny p-value (the smallest adjusted p is ≈ `r signif(min(res$adj.P.Val), 2)`), so the FDR cut alone would call a huge fraction of the transcriptome "significant". The biologically meaningful filter here is the **fold-change threshold**, not the p-value. The table below shows how the DE count shrinks as we tighten `|log2FC|`; we keep `|log2FC| ≥ `r params$lfc`` as the primary definition but report the stricter cuts for transparency.
+
+```{r lfc-thresholds}
+map_dfr(c(1, 1.5, 2), function(l) {
+  tibble(`|log2FC| >=` = l,
+         up_in_tumour   = sum(res$adj.P.Val < params$fdr & res$logFC >=  l),
+         down_in_tumour = sum(res$adj.P.Val < params$fdr & res$logFC <= -l))
+}) |>
+  knitr::kable(caption = "DE counts at increasing fold-change thresholds (FDR < 0.05).")
+```
+
+```{r de-top-table}
+p_fmt <- function(p) formatC(p, format = "e", digits = 2)   # avoid kable rounding p to 0
+top_dir <- function(dir, n = 12) {
+  res |> filter(direction == dir) |> slice_min(P.Value, n = n) |>
+    transmute(gene, logFC = round(logFC, 2),
+              meanNormal = round(meanNormal, 2), meanTumor = round(meanTumor, 2),
+              t = round(t, 1), adj.P.Val = p_fmt(adj.P.Val), direction)
+}
+bind_rows(top_dir("Up in tumour"), top_dir("Down in tumour")) |>
+  knitr::kable(caption = "Top 12 up- and top 12 down-regulated genes (by significance).")
+```
+
+# Visualisation
+
+## Volcano plot
+
+```{r volcano, fig.width=9, fig.height=6.5}
+#markers_up   <- c("CA9", "NDUFA4L2", "VEGFA", "ANGPTL4", "EGLN3", "NNMT", "SLC6A3")
+#markers_down <- c("UMOD", "SLC12A1", "CASR", "KCNJ1", "SLC34A1", "TMEM213")
+#known <- intersect(c(markers_up, markers_down), res$gene)
+
+lab <- bind_rows(
+  res |> filter(direction == "Up in tumour")   |> slice_min(P.Value, n = params$n_label),
+  res |> filter(direction == "Down in tumour") |> slice_min(P.Value, n = params$n_label),
+  #res |> filter(gene %in% known)
+) |> distinct(gene, .keep_all = TRUE)
+
+ggplot(res, aes(logFC, -log10(P.Value))) +
+  geom_point(aes(colour = direction), size = 0.7, alpha = 0.6) +
+  scale_colour_manual(values = c("Up in tumour" = "#D7301F",
+                                 "Down in tumour" = "#2171B5", "n.s." = "grey80")) +
+  geom_vline(xintercept = c(-params$lfc, params$lfc), linetype = "dashed", colour = "grey50") +
+  geom_hline(yintercept = -log10(params$fdr), linetype = "dashed", colour = "grey50") +
+  geom_text_repel(data = lab, aes(label = gene), size = 2.8, max.overlaps = 30,
+                  segment.size = 0.2, min.segment.length = 0) +
+  labs(title = "Tumour vs. normal - volcano", x = "log2 fold-change (tumour / normal)",
+       y = expression(-log[10]~italic(P)), colour = NULL) +
+  theme_minimal(base_size = 12)
+```
+
+## MA plot and p-value histogram
+
+```{r ma-pval, fig.width=10, fig.height=4}
+p_ma <- ggplot(res, aes(AveExpr, logFC, colour = direction)) +
+  geom_point(size = 0.6, alpha = 0.5) +
+  scale_colour_manual(values = c("Up in tumour" = "#D7301F",
+                                 "Down in tumour" = "#2171B5", "n.s." = "grey80"),
+                      guide = "none") +
+  geom_hline(yintercept = 0, colour = "grey40") +
+  labs(title = "MA plot", x = "Average log2 expression", y = "log2 fold-change") +
+  theme_minimal(base_size = 12)
+
+p_hist <- ggplot(res, aes(P.Value)) +
+  geom_histogram(boundary = 0, bins = 40, fill = "#7A0177", colour = "white") +
+  labs(title = "P-value distribution", x = "p-value", y = "genes") +
+  theme_minimal(base_size = 12)
+
+p_ma | p_hist
+```
+
+A p-value histogram is roughly uniform under the null with a spike near zero; the MA plot shows symmetric, expression-independent fold-changes.
+
+## Heatmap of top DE genes
+
+We show the top up- and top down-regulated genes, so both arms of the signature are visible.
+
+```{r heatmap, fig.width=9, fig.height=8}
+half <- params$n_heatmap %/% 2
+top_genes <- c(
+  res |> filter(direction == "Up in tumour")   |> slice_min(adj.P.Val, n = half) |> pull(gene),
+  res |> filter(direction == "Down in tumour") |> slice_min(adj.P.Val, n = half) |> pull(gene)
+)
+
+mat <- expr[top_genes, ]
+mat_z <- t(scale(t(mat)))                       # z-score each gene across samples
+ann_col <- data.frame(sample_type = group)
+rownames(ann_col) <- colnames(mat_z)
+
+pheatmap(mat_z,
+         annotation_col = ann_col,
+         annotation_colors = list(sample_type = type_cols),
+         show_colnames = FALSE, show_rownames = TRUE, fontsize_row = 6,
+         color = colorRampPalette(rev(brewer.pal(11, "RdBu")))(50),
+         breaks = seq(-3, 3, length.out = 51),
+         clustering_method = "ward.D2",
+         main = sprintf("Top %d DE genes (z-scored expression)", params$n_heatmap))
+```
+
+## Canonical marker boxplots (sanity check)
+
+```{r marker-box, fig.width=10, fig.height=5}
+show_markers <- intersect(c("CA9", "NDUFA4L2", "VEGFA", "UMOD", "SLC12A1", "CASR"),
+                          rownames(expr))
+mk_long <- as.data.frame(t(expr[show_markers, ])) |>
+  rownames_to_column("sample") |>
+  mutate(group = group) |>
+  pivot_longer(all_of(show_markers), names_to = "gene", values_to = "expr") |>
+  mutate(gene = factor(gene, levels = show_markers))
+
+ggplot(mk_long, aes(group, expr, fill = group)) +
+  geom_boxplot(outlier.size = 0.4) +
+  scale_fill_manual(values = type_cols, guide = "none") +
+  facet_wrap(~ gene, scales = "free_y", nrow = 2) +
+  labs(title = "Canonical ccRCC markers (up) and normal-tubule markers (down)",
+       x = NULL, y = "log2(count + 1)") +
+  theme_minimal(base_size = 11)
+```
+
+## Quantifying the compositional confound: immune-infiltrate score
+
+To turn the composition caveat into a measured quantity, we score each sample with a pan-immune marker panel (mean z-scored expression of leukocyte / antigen-presentation markers).
+
+```{r immune-score, fig.width=6, fig.height=4.5}
+immune_markers <- intersect(
+  c("PTPRC", "CD3D", "CD3E", "CD8A", "CD2", "LCK", "CD68", "CD14", "CD163",
+    "MS4A1", "CD19", "NKG7", "GZMB"),
+  rownames(expr))
+imm_z  <- t(scale(t(expr[immune_markers, ])))
+imm_df <- tibble(sample = colnames(expr), group = group, immune_score = colMeans(imm_z))
+wp <- wilcox.test(immune_score ~ group, data = imm_df)$p.value
+
+ggplot(imm_df, aes(group, immune_score, fill = group)) +
+  geom_boxplot(outlier.size = 0.5) +
+  scale_fill_manual(values = type_cols, guide = "none") +
+  labs(title = "Immune-infiltrate score by group",
+       subtitle = sprintf("%d leukocyte markers; Wilcoxon p = %s",
+                          length(immune_markers), format.pval(wp, digits = 2)),
+       x = NULL, y = "mean z(immune markers)") +
+  theme_minimal(base_size = 12)
+```
+
+Tumours carry a much higher immune-marker load, so a large part of the immune enrichment
+reflects **infiltrating leukocytes present in the tumour but absent from adjacent normal
+tissue**, not a tumour-cell-intrinsic programme.
+
+## External validation: overlap with a curated ccRCC signature
+
+Beyond the qualitative marker check, we test the DE list against a **curated set of literature ccRCC markers** (hypoxia/HIF and metabolic genes up; nephron/tubule genes down): are they enriched in our DE set (hypergeometric test), and do they move in the expected direction?
+
+```{r external-sig}
+sig_up <- c("CA9","NDUFA4L2","VEGFA","ANGPTL4","EGLN3","NNMT","SLC6A3","VIM","CXCR4",
+            "PLIN2","ENO2","SLC2A1","HILPDA","BNIP3","IGFBP3")
+sig_dn <- c("UMOD","SLC12A1","CASR","KCNJ1","SLC34A1","TMEM213","ATP6V0A4","CLDN8",
+            "FXYD4","NPHS2","SLC22A2","CALB1","AQP2","SLC12A3")
+sig <- intersect(c(sig_up, sig_dn), res$gene)
+de  <- res |> filter(direction != "n.s.") |> pull(gene)
+ov  <- intersect(sig, de)
+hp  <- phyper(length(ov) - 1, length(de), nrow(res) - length(de), length(sig),
+              lower.tail = FALSE)
+conc <- res |> filter(gene %in% sig) |>
+  mutate(expected   = ifelse(gene %in% sig_up, "Up in tumour", "Down in tumour"),
+         concordant = direction == expected)
+cat(sprintf("Curated markers tested: %d | recovered as DE: %d | hypergeometric p = %.1e\n",
+            length(sig), length(ov), hp))
+cat(sprintf("Direction-concordant with literature: %d / %d\n",
+            sum(conc$concordant), nrow(conc)))
+```
+
+The curated markers are recovered as DE with the correct direction — an independent confirmation that this is the genuine ccRCC programme, not a cohort-specific artefact.
+
+# Robustness: matched tumour–normal pairs
+
+Most normal samples come from the same patients as tumours. A **paired** analysis (blocking on patient) removes inter-patient variation and is a strong check that the signature is not driven by unmatched-cohort differences. We repeat limma on the matched subset with patient as a blocking factor and compare the gene lists.
+
+```{r paired}
+paired_patients <- group_info |>
+  count(patient, sample_type) |>
+  pivot_wider(names_from = sample_type, values_from = n, values_fill = 0) |>
+  filter(Tumor >= 1, Normal >= 1) |> pull(patient)
+
+pair_idx <- group_info$patient %in% paired_patients
+# one tumour + one normal per patient (first of each) to keep a clean paired design
+pair_tab <- group_info[pair_idx, ] |>
+  group_by(patient, sample_type) |> slice_head(n = 1) |> ungroup()
+
+expr_p  <- expr[, pair_tab$sample]
+grp_p   <- factor(pair_tab$sample_type, levels = c("Normal", "Tumor"))
+pat_p   <- factor(pair_tab$patient)
+
+design_p <- model.matrix(~ pat_p + grp_p)
+fit_p <- eBayes(lmFit(expr_p, design_p), trend = TRUE, robust = TRUE)
+res_p <- topTable(fit_p, coef = "grp_pTumor", number = Inf) |>
+  rownames_to_column("gene") |> as_tibble()
+
+cat(sprintf("Matched pairs: %d patients (%d samples).\n",
+            length(paired_patients), ncol(expr_p)))
+
+de_unpaired <- res   |> filter(direction != "n.s.") |> pull(gene)
+de_paired   <- res_p |> filter(adj.P.Val < params$fdr, abs(logFC) >= params$lfc) |> pull(gene)
+cat(sprintf("DE genes unpaired: %d | paired: %d | overlap: %d (%.1f%% of paired)\n",
+            length(de_unpaired), length(de_paired),
+            length(intersect(de_unpaired, de_paired)),
+            100 * length(intersect(de_unpaired, de_paired)) / max(1, length(de_paired))))
+```
+
+```{r paired-concordance, fig.width=6, fig.height=5}
+comp <- inner_join(res |> select(gene, lfc_unpaired = logFC),
+                   res_p |> select(gene, lfc_paired = logFC), by = "gene")
+ggplot(comp, aes(lfc_unpaired, lfc_paired)) +
+  geom_point(size = 0.5, alpha = 0.3, colour = "#4292C6") +
+  geom_abline(slope = 1, intercept = 0, colour = "grey40", linetype = "dashed") +
+  labs(title = "log2FC concordance: unpaired vs. paired",
+       x = "log2FC (all samples)", y = "log2FC (matched pairs)") +
+  theme_minimal(base_size = 12)
+```
+
+# Biological interpretation (enrichment)
+
+We annotate the signature with two complementary approaches: **GO over-representation** on the significant up/down gene sets, and **GSEA** on the full ranked list (Hallmark gene sets).
+
+> **Read with the composition caveat.** Several of the strongest up-in-tumour terms
+> (allograft rejection, interferon response, inflammatory response, T-cell activation) are
+> **immune-infiltrate** signals - the leukocytes quantified in the immune-score figure above
+> - not necessarily tumour-cell-intrinsic transcription. Hypoxia, glycolysis, E2F/G2M
+> proliferation and the OXPHOS/fatty-acid-metabolism *down* shift are more plausibly
+> tumour-intrinsic. We flag which leading-edge genes are immune-lineage below.
+
+## GO over-representation (Biological Process)
+
+```{r go-ora, fig.width=10, fig.height=7}
+universe <- res$gene
+run_go <- function(genes, title) {
+  eg <- enrichGO(gene = genes, universe = universe, OrgDb = org.Hs.eg.db,
+                 keyType = "SYMBOL", ont = "BP", pAdjustMethod = "BH",
+                 pvalueCutoff = 0.05, qvalueCutoff = 0.10, readable = FALSE)
+  if (is.null(eg) || nrow(as.data.frame(eg)) == 0) return(NULL)
+  # Collapse semantically redundant GO terms for a cleaner, non-repetitive figure.
+  eg <- clusterProfiler::simplify(eg, cutoff = 0.7, by = "p.adjust", select_fun = min)
+  as.data.frame(eg) |> slice_head(n = 12) |> mutate(set = title)
+}
+
+up_genes   <- res |> filter(direction == "Up in tumour")   |> pull(gene)
+down_genes <- res |> filter(direction == "Down in tumour") |> pull(gene)
+go_df <- bind_rows(run_go(up_genes, "Up in tumour"),
+                   run_go(down_genes, "Down in tumour"))
+
+if (!is.null(go_df) && nrow(go_df) > 0) {
+  go_df |>
+    group_by(set) |> slice_head(n = 10) |> ungroup() |>
+    mutate(Description = fct_reorder(Description, -log10(p.adjust))) |>
+    ggplot(aes(-log10(p.adjust), Description, fill = set)) +
+    geom_col() +
+    scale_fill_manual(values = c("Up in tumour" = "#D7301F", "Down in tumour" = "#2171B5"),
+                      guide = "none") +
+    facet_wrap(~ set, scales = "free", ncol = 1) +
+    labs(title = "GO Biological Process enrichment", x = expression(-log[10]~adj.~italic(P)),
+         y = NULL) +
+    theme_minimal(base_size = 10)
+} else {
+  cat("No significant GO terms returned.\n")
+}
+```
+
+## GSEA on Hallmark gene sets
+
+```{r gsea, fig.width=9, fig.height=6}
+ranks <- res |> filter(is.finite(t)) |> arrange(desc(t)) |>
+  distinct(gene, .keep_all = TRUE) |> select(gene, t) |> deframe()
+
+# msigdbr >= 10 renamed `category` to `collection`; support both.
+hm <- tryCatch(msigdbr(species = "Homo sapiens", collection = "H"),
+               error = function(e) msigdbr(species = "Homo sapiens", category = "H"))
+hallmark <- split(hm$gene_symbol, hm$gs_name)
+
+fg <- fgsea(pathways = hallmark, stats = ranks, minSize = 10, maxSize = 500) |>
+  as_tibble() |> arrange(padj)
+
+fg |> slice_head(n = 15) |>
+  transmute(pathway = str_replace_all(str_remove(pathway, "HALLMARK_"), "_", " "),
+            NES = round(NES, 2), padj = signif(padj, 3), size) |>
+  knitr::kable(caption = "Top Hallmark gene sets by adjusted p (GSEA).")
+
+fg |> filter(padj < 0.05) |> slice_max(abs(NES), n = 15) |>
+  mutate(pathway = fct_reorder(str_remove(pathway, "HALLMARK_"), NES)) |>
+  ggplot(aes(NES, pathway, fill = NES > 0)) +
+  geom_col() +
+  scale_fill_manual(values = c("TRUE" = "#D7301F", "FALSE" = "#2171B5"),
+                    labels = c("TRUE" = "up in tumour", "FALSE" = "down in tumour"),
+                    name = NULL) +
+  labs(title = "Hallmark GSEA (FDR < 0.05)", x = "Normalised enrichment score", y = NULL) +
+  theme_minimal(base_size = 11)
+```
+
+**Leading-edge genes** - the core genes driving the strongest enrichments - make the
+signature concrete and give candidate features for the downstream models. The last column
+counts how many of the shown leading-edge genes are **immune-lineage** markers (a proxy for
+how compositional, vs. tumour-intrinsic, each enrichment is).
+
+The immune-lineage reference is **not hand-picked**: we take the union of the mature-leukocyte
+cell-type signatures from the **`HAY_BONE_MARROW`** hematopoietic single-cell atlas (Hay et
+al., *Exp. Hematol.* 2018), as distributed in **MSigDB C8** and loaded here via `msigdbr`
+(v`r as.character(packageVersion("msigdbr"))`). We explicitly select the differentiated
+immune populations and exclude progenitor, erythroid, platelet and stromal clusters. As a
+sanity check we print the panel size and its immune-fraction enrichment for a known immune
+vs. a known metabolic pathway.
+
+```{r gsea-leading-edge}
+# Versioned, sourced immune panel: mature leukocyte populations from the HAY bone-marrow
+# single-cell reference (MSigDB C8, Hay et al. 2018). Progenitors/erythroid/platelet/stromal
+# clusters are deliberately excluded so the panel is leukocyte-specific.
+hay_immune_sets <- c(
+  "HAY_BONE_MARROW_CD8_T_CELL", "HAY_BONE_MARROW_NAIVE_T_CELL",
+  "HAY_BONE_MARROW_FOLLICULAR_B_CELL", "HAY_BONE_MARROW_PRO_B",
+  "HAY_BONE_MARROW_NK_CELLS", "HAY_BONE_MARROW_MONOCYTE",
+  "HAY_BONE_MARROW_DENDRITIC_CELL", "HAY_BONE_MARROW_PRE_DENDRITIC",
+  "HAY_BONE_MARROW_NEUTROPHIL", "HAY_BONE_MARROW_IMMATURE_NEUTROPHIL",
+  "HAY_BONE_MARROW_EOSINOPHIL", "HAY_BONE_MARROW_PLASMA_CELL")
+c8 <- tryCatch(msigdbr(species = "Homo sapiens", collection = "C8"),
+               error = function(e) msigdbr(species = "Homo sapiens", category = "C8"))
+immune_lineage <- c8 |> filter(gs_name %in% hay_immune_sets) |>
+  distinct(gene_symbol) |> pull(gene_symbol)
+
+is_immune <- function(g) mean(g %in% immune_lineage)  # immune fraction of a gene vector
+cat(sprintf("Immune-lineage panel (HAY C8): %d genes (%.1f%% of tested).\n",
+            length(immune_lineage), 100 * length(immune_lineage) / nrow(res)))
+cat(sprintf("Immune fraction of leading edge — ALLOGRAFT_REJECTION: %.2f | OXIDATIVE_PHOSPHORYLATION: %.2f\n",
+            is_immune(head(fg$leadingEdge[[which(fg$pathway == "HALLMARK_ALLOGRAFT_REJECTION")]], 8)),
+            is_immune(head(fg$leadingEdge[[which(fg$pathway == "HALLMARK_OXIDATIVE_PHOSPHORYLATION")]], 8))))
+
+fg |> slice_head(n = 6) |>
+  mutate(pathway = str_replace_all(str_remove(pathway, "HALLMARK_"), "_", " "),
+         NES = round(NES, 2),
+         le  = map(leadingEdge, ~ head(.x, 8)),
+         `leading-edge genes` = map_chr(le, ~ paste(.x, collapse = ", ")),
+         `immune / shown` = map_chr(le, ~ sprintf("%d / %d", sum(.x %in% immune_lineage), length(.x)))) |>
+  select(pathway, NES, `leading-edge genes`, `immune / shown`) |>
+  knitr::kable(caption = "Leading-edge genes for the top Hallmark pathways (immune-lineage count, from the HAY C8 panel, flags compositional signal).")
+```
+
+# Bridge to the survival question: are DE genes prognostic?
+
+This DGE step **validates the data** — it confirms the expected tumour-vs-normal biology. But the project's actual question is survival *within tumours*, and a strong tumour-vs-normal gene is **not** automatically prognostic. We fit, for every DE gene (overall survival, tumours only), both a **univariate** Cox model and one **adjusted for stage and grade** — the dominant ccRCC prognosticators — to see how much apparent prognostic signal is independent of them. We report **hazard ratios** (effect size), not just significance counts, because with ~520 tumours univariate p-values are again saturated.
+
+```{r cox-bridge, fig.width=10, fig.height=4.5}
+surv <- fread(path("KIRC_survival.txt"),
+              sep = "\t", header = TRUE, na.strings = c("", "NA"))
+tum <- colnames(expr)[group == "Tumor"]
+cl  <- tibble(sample = tum,
+              OS = surv$OS[match(tum, surv$sample)], OS.time = surv$OS.time[match(tum, surv$sample)],
+              stage = pheno$pathologic_stage[match(tum, pheno$sampleID)],
+              grade = pheno$neoplasm_histologic_grade[match(tum, pheno$sampleID)]) |>
+  mutate(stage = factor(str_replace(stage, "\\[Discrepancy\\]", NA_character_),
+                        levels = c("Stage I","Stage II","Stage III","Stage IV")),
+         grade = factor(na_if(grade, "GX"), levels = c("G1","G2","G3","G4")))
+keepc <- with(cl, !is.na(OS) & !is.na(OS.time) & OS.time > 0 & !is.na(stage) & !is.na(grade))
+tumK  <- cl$sample[keepc]
+Sy    <- Surv(cl$OS.time[keepc], cl$OS[keepc])
+stage <- droplevels(cl$stage[keepc]); grade <- droplevels(cl$grade[keepc])
+
+de_genes <- res |> filter(direction != "n.s.") |> pull(gene)
+X <- t(expr[de_genes, tumK])                       # tumours x DE genes
+
+# Univariate Cox and a stage+grade-adjusted Cox for every DE gene.
+cox_stat <- function(j) {
+  x  <- as.numeric(scale(X[, j]))
+  f1 <- tryCatch(coxph(Sy ~ x), error = function(e) NULL)
+  f2 <- tryCatch(coxph(Sy ~ x + stage + grade), error = function(e) NULL)
+  c(if (is.null(f1)) NA else summary(f1)$coefficients[1, "coef"],
+    if (is.null(f1)) NA else summary(f1)$coefficients[1, "Pr(>|z|)"],
+    if (is.null(f2)) NA else summary(f2)$coefficients["x", "Pr(>|z|)"])
+}
+cx  <- t(vapply(seq_len(ncol(X)), cox_stat, numeric(3)))
+cox <- tibble(gene = colnames(X), cox_coef = cx[, 1], cox_p = cx[, 2], adj_p = cx[, 3]) |>
+  mutate(HR = exp(cox_coef), cox_fdr = p.adjust(cox_p, "BH"), adj_fdr = p.adjust(adj_p, "BH")) |>
+  inner_join(res |> select(gene, logFC, direction), by = "gene")
+
+n_uni  <- sum(cox$cox_fdr < 0.05, na.rm = TRUE)
+n_adj  <- sum(cox$adj_fdr < 0.05, na.rm = TRUE)
+n_both <- sum(cox$cox_fdr < 0.05 & cox$adj_fdr < 0.05, na.rm = TRUE)
+r_signed <- cor(cox$logFC, cox$cox_coef, use = "complete.obs")
+cat(sprintf("Adjusted-Cox cohort: %d tumours (complete OS + stage + grade).\n", length(tumK)))
+cat(sprintf("Prognostic DE genes  univariate: %d (%.0f%%)  |  stage+grade-adjusted: %d (%.0f%%)\n",
+            n_uni, 100*n_uni/nrow(cox), n_adj, 100*n_adj/nrow(cox)))
+cat(sprintf("  -> %.0f%% of univariate hits survive stage/grade adjustment;\n the rest were largely stage/grade proxies.\n",
+            100 * n_both / max(1, n_uni)))
+cat(sprintf("Prognostic-gene hazard ratios (per SD): median %.2f, IQR [%.2f, %.2f].\n",
+            median(cox$HR[cox$cox_fdr < 0.05], na.rm = TRUE),
+            quantile(cox$HR[cox$cox_fdr < 0.05], .25, na.rm = TRUE),
+            quantile(cox$HR[cox$cox_fdr < 0.05], .75, na.rm = TRUE)))
+cat(sprintf("cor(tumour-vs-normal log2FC, Cox log-HR) = %.2f\n  (weak positive: up-in-tumour leans to worse survival)\n", r_signed))
+
+# Signed: does UP in tumour mean WORSE survival? (log2FC vs Cox log-HR)
+p_signed <- ggplot(cox, aes(logFC, cox_coef, colour = direction)) +
+  geom_point(size = 0.5, alpha = 0.35) +
+  scale_colour_manual(values = c("Up in tumour"="#D7301F","Down in tumour"="#2171B5"), guide = "none") +
+  geom_hline(yintercept = 0, colour = "grey50") + geom_vline(xintercept = 0, colour = "grey50") +
+  labs(title = "Direction vs. prognosis", x = "log2FC (tumour vs. normal)",
+       y = "Cox log-HR (OS)") + theme_minimal(base_size = 11)
+
+top_prog <- cox |> filter(cox_fdr < 0.05) |> slice_min(cox_p, n = 15) |>
+  mutate(gene = fct_reorder(gene, -log10(cox_p)))
+p_top <- ggplot(top_prog, aes(-log10(cox_p), gene, fill = HR > 1)) +
+  geom_col() +
+  scale_fill_manual(values = c("TRUE"="#D7301F","FALSE"="#2171B5"),
+                    labels = c("TRUE"="worse surv.","FALSE"="better surv."), name = NULL) +
+  labs(title = "Most prognostic DE genes", x = expression(-log[10]~Cox~italic(P)), y = NULL) +
+  theme_minimal(base_size = 10)
+
+p_signed | p_top
+```
+
+Takeaways for the survival notebook: **(1)** a large share of DE genes look univariately
+prognostic, but only **`r round(100*n_both/max(1,n_uni))`%** survive adjustment for stage and
+grade - much of the raw "prognostic" signal is a **stage/grade proxy**; **(2)** the strongest
+*independent* signal is a **cell-cycle / proliferation** programme (e.g. CDCA3, UBE2C, CCNF,
+TROAP) associated with worse survival - a non-compositional, tumour-intrinsic effect; and
+**(3)** the tumour programme leans *weakly* toward worse prognosis (signed log2FC-vs-log-HR
+r ≈ `r round(r_signed, 2)`; left panel), but the association is loose - tumour-vs-normal
+magnitude explains only a few percent of prognostic variance. So the survival models must
+**learn survival-relevant features directly**, not inherit them from this contrast. (Hence we
+use the DE list only as an *unsupervised* expression filter, never selecting features with
+survival labels — avoiding information leakage into cross-validation.)
+
+# Export results
+
+The full ranked table is written to disk for downstream feature selection, MOFA-factor
+interpretation, and the survival models.
+
+The table also carries the univariate-Cox prognostic columns (OS, tumours only) so the
+downstream notebooks can use them directly.
+
+```{r export}
+out_file <- "DGE_tumor_vs_normal_limma.csv"
+res |>
+  left_join(cox |> select(gene, cox_HR = HR, cox_p, cox_fdr, cox_adj_fdr = adj_fdr),
+            by = "gene") |>
+  transmute(gene, logFC, meanNormal, meanTumor, AveExpr, t, P.Value, adj.P.Val, direction,
+            cox_HR, cox_p, cox_fdr, cox_adj_fdr) |>
+  arrange(adj.P.Val) |>
+  write_csv(out_file)
+```
+
+# Summary
+
+Comparing **534 tumour (533 primary + 1 additional-primary) vs. 72 adjacent normal** kidney samples (18,684 genes tested, sex-adjusted `limma`), the analysis produced the following results.
+
+- **A large, balanced, biologically correct signature.** `r sum(res$direction != "n.s.")` genes are differentially expressed at |log2FC| ≥ `r params$lfc` and FDR < `r params$fdr` - `r sum(res$direction == "Up in tumour")` up and `r sum(res$direction == "Down in tumour")` down in tumour.
+
+- **Significance is saturated: effect size does the filtering.** With 605 samples the smallest adjusted p ≈ `r signif(min(res$adj.P.Val), 2)`; essentially the whole transcriptome is "significant", so the |log2FC| threshold, not the FDR, defines the gene set (DE shrinks 4,943 → 2,968 → 1,861 as the cut tightens 1.0 → 1.5 → 2.0). The most extreme fold-changes are genuine **on/off genes**;
+
+- **Robust to design.** The matched-pair analysis (72 patients, patient-blocked) recovers **91.5 %** of the DE genes with tightly concordant fold-changes - the signature is not an artefact of comparing unmatched cohorts.
+
+- **Pathways, read with a *measured* composition caveat.** Hallmark GSEA is up for immune/inflammatory (allograft rejection, IFN-γ/α, IL6-JAK-STAT3, inflammatory response), proliferation (E2F targets, G2M) and hypoxia/glycolysis/EMT, and down for oxidative phosphorylation, fatty-acid and bile-acid metabolism. But an immune-infiltrate score is far higher in tumours (**Wilcoxon p < 2e-16**), so much of the immune signal reflects **infiltrating leukocytes** (present in tumour, absent in normal), not tumour-cell-intrinsic transcription. The hypoxia/glycolysis-up, OXPHOS/fatty-acid-down metabolic switch is the tumour-intrinsic core.
+
+- **DE is not prognostic, and much apparent prognosis is stage-driven.** On the `r length(tumK)` tumours with complete outcome data, `r n_uni` DE genes (`r round(100*n_uni/nrow(cox))` %) are univariately prognostic for overall survival, but only `r n_adj` (`r round(100*n_adj/nrow(cox))` %) remain after adjusting for **stage and grade** - ≈ `r round(100*n_both/max(1,n_uni))` % of univariate hits survive, the rest being stage/grade proxies (prognostic HRs are modest: median `r round(median(cox$HR[cox$cox_fdr<0.05], na.rm=TRUE), 2)` per SD). Tumour-vs-normal fold-change correlates only weakly with prognosis (signed log2FC-vs-log-HR r ≈ `r round(r_signed, 2)`): the tumour programme leans slightly toward worse survival but explains little prognostic variance. The clearest *independent* signal is a **proliferation programme** (CDCA3, UBE2C, CCNF, TROAP, KIF18B, CHFR - worse survival). The survival models must therefore learn prognostic features directly; the DE list is used only as an **unsupervised** expression filter (no survival labels), avoiding leakage.
+
+```{r session-info}
+sessionInfo()
+# Removes all objects in the current workspace
+rm(list = ls(all.names = TRUE))
+# Frees up memory
+gc() 
+```

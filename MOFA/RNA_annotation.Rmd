@@ -1,0 +1,386 @@
+---
+title: "Plotting_annotations"
+author: "Tilo Alves Radtke 5444028"
+date: "2026-07-12"
+output: html_document
+---
+```{r working directory}
+setwd("D:/Uni/Master/Data Science/Project/Code_local/MOFA")
+```
+
+
+MOFA RNA Annotation + Enrichment Analysis Pipeline:
+First we load the packages. The output is muted here, so set echo=TRUE if you encounter issues.
+```{r setup, echo=FALSE}
+
+
+if (!requireNamespace("BiocManager", quietly = TRUE))
+    install.packages("BiocManager")
+
+pkgs <- c(
+    "dplyr",
+    "clusterProfiler",
+    "org.Hs.eg.db",
+    "AnnotationDbi",
+    "ggplot2"
+)
+
+for(pkg in pkgs){
+    if(!requireNamespace(pkg, quietly = TRUE)){
+        BiocManager::install(pkg, ask = TRUE)
+    }
+}
+
+library(dplyr)
+library(clusterProfiler)
+library(org.Hs.eg.db)
+library(AnnotationDbi)
+library(ggplot2)
+
+```
+
+We first load the data. as input the top 500 features of each factor is used.
+```{r loading}
+#INPUT_FILE <- "data/feature_weights.csv"
+
+INPUT_FILE <- "data/mofa_top_500_features_per_factor.csv"
+TOP_N <- 500
+
+OUTDIR <- "data/MOFA_RNA_Anno"
+
+dir.create(
+    OUTDIR,
+    showWarnings = FALSE
+)
+
+weights <- read.csv(
+    INPUT_FILE,
+    stringsAsFactors = FALSE
+)
+
+
+rna <- weights %>%
+    dplyr::filter(
+        grepl(
+            "RNA|rna|expression",
+            View,
+            ignore.case = TRUE
+        )
+    )
+
+cat(
+    "RNA features found:",
+    nrow(rna),
+    "\n"
+)
+
+#This just removes the suffix we attached in MOFA
+rna$Gene <- gsub(
+    "_rna$",
+    "",
+    rna$Feature_Name
+)
+
+```
+
+We annotate the RNA features using org.Hs.eg.db. This uses the human annotation database.
+```{r annotation}
+anno <- AnnotationDbi::select(
+    org.Hs.eg.db,
+    keys = unique(rna$Gene),
+    keytype = "SYMBOL",
+    columns = c(
+        "SYMBOL",
+        "ENTREZID",
+        "GENENAME"
+    )
+)
+
+rna <- dplyr::left_join(
+    rna,
+    anno,
+    by = c(
+        "Gene" = "SYMBOL"
+    )
+)
+
+rna <- rna %>%
+    dplyr::filter(
+        !is.na(ENTREZID)
+    )
+
+write.csv(
+    rna,
+    file.path(
+        OUTDIR,
+        "Annotated_RNA_Features.csv"
+    ),
+    row.names = FALSE
+)
+
+factors <- unique(
+    rna$Factor
+)
+
+all_results <- list()
+
+```
+
+Here we use enrichGO() to perform a Gene Ontology enrichment on the feature genes. It also calculates, whether the results are significant with a FDR < 0.05.
+```{r GO ENRICHMENT}
+for(f in factors){
+
+    cat(
+        "\nProcessing",
+        f,
+        "\n"
+    )
+
+    factor_dir <- file.path(
+        OUTDIR,
+        f
+    )
+
+    dir.create(
+        factor_dir,
+        recursive = TRUE,
+        showWarnings = FALSE
+    )
+
+    tmp <- rna %>%
+        dplyr::filter(
+            Factor == f
+        )
+
+    if(nrow(tmp) < 20){
+
+        cat(
+            "Skipping:",
+            f,
+            "\n"
+        )
+
+        next
+    }
+
+    #goes over the top features
+
+    tmp <- tmp %>%
+        dplyr::arrange(
+            desc(abs(Raw_Weight))
+        ) %>%
+        dplyr::slice_head(
+            n = TOP_N
+        )
+
+    write.csv(
+        tmp,
+        file.path(
+            factor_dir,
+            paste0(
+                f,
+                "_Top500Genes.csv"
+            )
+        ),
+        row.names = FALSE
+    )
+
+    genes <- unique(
+        tmp$ENTREZID
+    )
+
+    genes <- genes[
+        !is.na(genes)
+    ]
+
+    if(length(genes) < 10){
+
+        next
+    }
+
+    # the actual GO enrichment
+
+    ego <- tryCatch({
+
+        enrichGO(
+            gene = genes,
+            OrgDb = org.Hs.eg.db,
+            keyType = "ENTREZID",
+            ont = "BP",
+            pAdjustMethod = "BH",
+            readable = TRUE
+        )
+
+    }, error = function(e){
+
+        NULL
+
+    })
+
+    if(is.null(ego))
+        next
+
+    go_df <- as.data.frame(
+        ego
+    )
+
+    if(nrow(go_df) == 0)
+        next
+
+    go_df$Factor <- f
+
+    write.csv(
+        go_df,
+        file.path(
+            factor_dir,
+            paste0(
+                f,
+                "_GO.csv"
+            )
+        ),
+        row.names = FALSE
+    )
+
+    sig_go <- go_df %>%
+        dplyr::filter(
+            p.adjust < 0.05
+        )
+
+    write.csv(
+        sig_go,
+        file.path(
+            factor_dir,
+            paste0(
+                f,
+                "_GO_Significant.csv"
+            )
+        ),
+        row.names = FALSE
+    )
+
+    if(nrow(sig_go) > 0){
+
+        all_results[[f]] <- sig_go
+
+    }
+}
+```
+
+
+All significant results are put into the table All_Factors_Significant_GO.csv for all factors.
+```{r Sign_results}
+if(length(all_results) == 0){
+
+    stop(
+        "No significant pathways found."
+    )
+}
+
+combined <- dplyr::bind_rows(
+    all_results
+)
+
+write.csv(
+    combined,
+    file.path(
+        OUTDIR,
+        "All_Factors_Significant_GO.csv"
+    ),
+    row.names = FALSE
+)
+
+#KEEP TOP 10 TERMS PER FACTOR
+
+plot_df <- combined %>%
+    dplyr::group_by(
+        Factor
+    ) %>%
+    dplyr::arrange(
+        p.adjust
+    ) %>%
+    dplyr::slice_head(
+        n = 10
+    ) %>%
+    dplyr::ungroup()
+
+plot_df$Score <- -log10(
+    plot_df$p.adjust
+)
+
+
+```
+
+This codeblock creates a unused Bubbleplot of the significant pathway results per factor.
+```{r Bubbleplot}
+p <- ggplot(
+    plot_df,
+    aes(
+        x = Factor,
+        y = Description
+    )
+) +
+
+geom_point(
+    aes(
+        size = Count,
+        color = Score
+    )
+) +
+
+theme_bw() +
+
+theme(
+    axis.text.y = element_text(size = 8),
+    axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1)  # slant x-axis labels
+) +
+
+labs(
+    title = "RNA GO Enrichment (Top 500 Genes per Factor)",
+    size = "Gene Count",
+    color = "-log10(FDR)"
+)
+
+ggsave(
+    file.path(
+        OUTDIR,
+        "RNA_GO_Bubbleplot.pdf"
+    ),
+    p,
+    width = 12,
+    height = 10
+)
+```
+
+The top 10 pathways per factor are put into Top_Pathway_Per_Factor.csv, to create a overview of what the different factors do. There are pathways, that were cut out of factor 1 and 2, that were more significant than any pathways from factor 14 f.E., but this is about getting a overview of all factors in "Top annotation plots RNA_METH.Rmd".
+```{r}
+summary_df <- plot_df %>%
+    dplyr::group_by(
+        Factor
+    ) %>%
+    dplyr::slice_min(
+        p.adjust,
+        n = 1
+    ) %>%
+    dplyr::ungroup()
+
+write.csv(
+    summary_df,
+    file.path(
+        OUTDIR,
+        "Top_Pathway_Per_Factor.csv"
+    ),
+    row.names = FALSE
+)
+
+cat(
+    "\nFinished.\n"
+)
+
+cat(
+    "\nResults written to:",
+    OUTDIR,
+    "\n"
+)
+```
+
+

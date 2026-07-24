@@ -1,0 +1,1283 @@
+---
+title: "TCGA - KIRC Cohort QC: Kidney Clear Cell Carcinoma Quality Control"
+author: 'Group 7: Maksim Danilchyk, Sofya Shorzhina, Tilo Alves Radtke, Kristian Reinhart'
+#date: "`r format(Sys.Date(), '%B %d, %Y')`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    theme: flatly
+    highlight: tango
+    code_folding: show
+    fig_width: 10
+    fig_height: 6
+    df_print: paged
+  pdf_document:
+    toc: true
+    toc_depth: '3'
+    latex_engine: xelatex
+editor_options: 
+  markdown: 
+    wrap: 72
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo      = FALSE,
+  message   = FALSE,
+  warning   = FALSE,
+  cache     = FALSE,
+  fig.align = "center"
+)
+```
+
+------------------------------------------------------------------------
+
+# Overview
+
+Having chosen the TCGA KIRC Cohort we begin the Quality Control of the
+available data.
+
+The TCGA KIRC Dataset can be found on the Xenabrowser webpages hosted by
+the University of Santa Cruz:
+[https://xenabrowser.net/datapages/?cohort=TCGA%20Kidney%20Clear%20Cell%20Carcinoma%20(KIRC)](https://xenabrowser.net/datapages/?cohort=TCGA%20Kidney%20Clear%20Cell%20Carcinoma%20(KIRC)){.uri}
+
+The dataset offers several different modalities, most notably the
+following ones:
+
+- RNAseq gene expression, whole genome, IlluminaHiSeq_RNASeqV2
+  - log2(norm_count+1) transformed, 20.531 identifiers X 606 samples
+  - Download Link:
+    <https://xenabrowser.net/datapages/?dataset=TCGA.KIRC.sampleMap%252FHiSeqV2>
+  - Original Filename: HiSeqV2.gz
+  - Renamed Filename: HiSeqV2
+- Exon expression RNAseq, IlluminaHiSeq_RNASeqV2
+  - log2(norm_count+1) transformed, 239.323 identifiers X 606 samples
+  - Download Link:
+    <https://xenabrowser.net/datapages/?dataset=TCGA.KIRC.sampleMap%252FHiSeqV2_exon>
+  - Original Filename: HiSeqV2_exon.gz
+  - Renamed Filename: HiSeqV2_exon
+- DNA methylation, Illumina Infinium HumanMethylation450
+  - beta value transformed, 485.578 identifiers X 480 samples
+  - Download Link:
+    <https://xenabrowser.net/datapages/?dataset=TCGA.KIRC.sampleMap%252FHumanMethylation450>
+  - Original Filename: HumanMethylation450.gz
+  - Renamed Filename: Methylation450
+- Phenotypes
+  - Clinical metadata such as patient age, sex, diagnosis, etc.; 945
+    samples X 112 identifiers
+  - Download Link:
+    <https://xenabrowser.net/datapages/?dataset=TCGA.KIRC.sampleMap%252FKIRC_clinicalMatrix>
+  - Original Filename: KIRC_clinicalMatrix
+  - Renamed Filename: KIRC_clinicalMatrix
+- Curated Survival Data
+  - Curated survival data including OS: overall survial, PFI:
+    progression-free interval, DSS: disease-specific survival, DFI:
+    disease-free interval; 944 samples X 11 identifiers
+  - Download Link:
+    <https://xenabrowser.net/datapages/?dataset=survival%252FKIRC_survival.txt>
+  - Original Filename: KIRC_survival.txt
+  - Renamed Filename: KIRC_survival.txt
+- Somatic Mutation (SNP and INDEL) - MC3 gene-level non-silent mutation
+  - binary non-silent mutation call, 40.544 identifiers X 368 samples
+  - Download Link:
+    <https://xenabrowser.net/datapages/?dataset=mc3_gene_level%252FKIRC_mc3_gene_level.txt>
+  - Original Filename: KIRC_mc3_gene_level.txt.gz
+  - Renamed Filename: KIRC_mc3_gene_level.txt
+- Thresholded gene-level Copy Number Variation (CNV), GISTIC2 method
+  - Copy number (gene-level) thresholded to integer values, 24.777
+    identifiers X 528 samples
+  - Download Link:
+    <https://xenabrowser.net/datapages/?dataset=TCGA.KIRC.sampleMap%252FGistic2_CopyNumber_Gistic2_all_thresholded.by_genes>
+  - Original Filename:
+    Gistic2_CopyNumber_Gistic2_all_thresholded.by_genes.gz
+  - Renamed Filename: Gistic2_CopyNumber_Gistic2_all_thresholded.by_genes
+- Protein expression RPPA
+  - Protein expression by reverse phase protein array (RPPA), normalized RPPA value, 274 identifiers X 478 samples
+  - Download Link:
+    <https://xenabrowser.net/datapages/?dataset=TCGA.KIRC.sampleMap%252FRPPA>
+  - Original Filename: RPPA.gz
+  - Renamed Filename: RPPA
+
+Additionally of interest are the codes for encoding the sample type
+(i.e. the type of the sample such as "primary tumor", "normal tissue",
+etc.) whose explanation can be found here:\
+<https://gdc.cancer.gov/resources-tcga-users/tcga-code-tables/sample-type-codes>
+
+As well as a more general overview of the sample code meaning:\
+<https://docs.gdc.cancer.gov/Encyclopedia/pages/TCGA_Barcode/>
+
+# 1. Setup
+
+## 1.1 Libraries
+
+```{r Loading Libraries}
+library(dplyr)
+library(tidyr)
+library(readr)
+library("stringr")
+library(ggplot2)
+library(matrixStats) # For rowMedians in RLE plots
+library(patchwork) # For plot layout, especially for the inclusive intersetc (UpSet-like) plot
+library(RColorBrewer) # Additional color palette
+library(forcats) # For reordering columns / rows in a data.frame
+
+# For MEAN-SD-plot using a nice package
+#if (!requireNamespace("BiocManager", quietly = TRUE))
+#    install.packages("BiocManager")
+#BiocManager::install("vsn")
+library(vsn)
+```
+
+## 1.2 Loading Data
+
+```{r Loading Data}
+# RNA-seq data, whole genome
+# SampleIDs for patients are colnames
+RNAseq_mat <- read_delim("TCGA-KIRC/HiSeqV2.txt",
+                                  delim = "\t", escape_double = FALSE,
+                                  trim_ws = TRUE)
+colnames(RNAseq_mat)[colnames(RNAseq_mat) == 'sample'] <- 'geneID'
+
+# Methylation data over whole genome
+# SampleIDs for patients are colnames
+Methylation450k_mat <- read_delim("TCGA-KIRC/HumanMethylation450.txt",
+                                                 delim = "\t", escape_double = FALSE,
+                                                 trim_ws = TRUE)
+
+# Gene Level Copy Number of Genes, Thresholded to whole number values such as -2, -1, 0, 1, 2
+# SampleIDs for patients are colnames
+GeneLevelCopyNumberThresholded_mat <- read_delim("TCGA-KIRC/Gistic2_CopyNumber_Gistic2_all_thresholded.by_genes.txt",
+                                                 delim = "\t", escape_double = FALSE,
+                                                 trim_ws = TRUE)
+
+# Somatic mutations such as SNPs and INDELS over whole genome
+# SampleIDs for patients are colnames
+SomaticMutationSnpIndel_mat <- read_delim("TCGA-KIRC/KIRC_mc3_gene_level.txt",
+                                                 delim = "\t", escape_double = FALSE,
+                                                 trim_ws = TRUE)
+
+# Exon expression over whole genome
+# SampleIDs for patients are colnames
+# NOTE: Unnecessary as exon expressions are used to calculate RNAseq gene expressions, so basically duplicate data that's only relevant if we're looking into alternate splicing or some such stuff
+ExonExpression_mat <- read_delim("TCGA-KIRC/HiSeqV2_exon.txt",
+                                                delim = "\t", escape_double = FALSE,
+                                                trim_ws = TRUE)
+
+# Protein Expression RPPA
+# SampleIDs for patients are colnames
+ProteinExpressionRPPA_mat <- read_delim("TCGA-KIRC/RPPA.txt",
+                                                delim = "\t", escape_double = FALSE,
+                                                trim_ws = TRUE)
+
+# Phenotypes of patients, basically metadata about age, tumor types, treatments, etc.
+# SampleIDs for patients are colnames
+Phenotypes_mat <- read_delim("TCGA-KIRC/KIRC_clinicalMatrix.txt",delim = "\t", escape_double = FALSE,
+                                              trim_ws = TRUE)
+
+# Curated survival data of the patients
+# SampleIDs for patients are the column "sampleID"
+Survival_mat <- read_delim("TCGA-KIRC/KIRC_survival.txt",
+                                                 delim = "\t", escape_double = FALSE,
+                                                 trim_ws = TRUE)
+colnames(Survival_mat)[colnames(Survival_mat) == 'sample'] <- 'sampleID'
+
+
+
+head(RNAseq_mat)
+head(Methylation450k_mat)
+head(GeneLevelCopyNumberThresholded_mat)
+head(SomaticMutationSnpIndel_mat)
+head(ExonExpression_mat)
+head(ProteinExpressionRPPA_mat)
+head(Phenotypes_mat)
+head(Survival_mat)
+```
+
+## 1.2 Upset-Style Inclusive Intersect Plot
+
+In order to get a better understanding of the available sample numbers
+and the distribution of tumor VS normal tissue samples in those
+combinations we look at an inclusive intersect plot. UpSet plots are
+unfortunately not suitable for our purposes as they do not compute true
+intersects between the selection sets, or at least no such function is
+available in R directly.
+
+With the inclusive intersect plot we visualize the overlap in sample IDs
+across the selected omics layers available and color them by their
+tissue type, i.e. tumor (regardless of actual classification, i.e.
+primary tumor, new primary, etc.) and normal tissue.
+
+```{r, Upset-Style Inclusive Intersect Plot}
+# Get all patient IDs
+allPatientIDs <- unique(Phenotypes_mat$sampleID)
+
+# Create binary membership matrix for the upset plot
+upset_df <- data.frame(
+    RNA = allPatientIDs %in% colnames(RNAseq_mat),
+    ExonExpression = allPatientIDs %in% colnames(ExonExpression_mat),
+    ProteinExpressionRPPA = allPatientIDs %in% colnames(ProteinExpressionRPPA_mat),
+    Methylation = allPatientIDs %in% colnames(Methylation450k_mat),
+    CopyNum = allPatientIDs %in% colnames(GeneLevelCopyNumberThresholded_mat),
+    SomaticMut = allPatientIDs %in% colnames(SomaticMutationSnpIndel_mat),
+    Phenotype = allPatientIDs %in% Phenotypes_mat$sampleID,
+    Survival  = allPatientIDs %in% Survival_mat$sampleID
+)
+
+# Add tissueType for coloring of the data
+upset_df$tissueType <- str_sub(allPatientIDs, start = -2, end = -1)
+upset_df$tissueType[upset_df$tissueType=="01"] <- "tumor"
+upset_df$tissueType[upset_df$tissueType=="05"] <- "tumor" # Just 1 sample, fine to count it as tumor as well
+upset_df$tissueType[upset_df$tissueType=="11"] <- "normal"
+
+# Define which omics layers should be used for the combination computation
+omicsToUse <- setdiff(names(upset_df), "tissueType")
+
+# All non-empty combinations
+combinations <- unlist(
+    lapply(1:length(omicsToUse), function(k)
+        combn(omicsToUse, k, simplify = FALSE)),
+    recursive = FALSE
+)
+
+# Go through all combinations to build a long dataframe with the inclusive overlap of the selected modalities and tumor / normal samples
+intersections <- lapply(combinations, function(s){
+    # Get the tissue type for all rows whose sampeIDs are present in all modalities as selected by s
+    tisType <-  upset_df |>
+        filter(if_all(s)) |>
+        select(tissueType)
+    # Build a data frame with the modality combination and tissue type to return
+    res <- data.frame(
+        tissueType = tisType,
+        intersect = rep(paste0(s,collapse="&"),times=length(tisType))
+    )
+}) |>
+    bind_rows()
+
+# Build a data.frame of the various combinations for the upset plot
+intersectionCombinations <- do.call(rbind, lapply(combinations, function(x) {
+    data.frame(
+        combination = paste(x, collapse = "&"),
+        entry = x,
+        stringsAsFactors = FALSE
+    )
+}))
+
+
+# Top Plot
+p_top <-
+    ggplot(intersections,
+           aes(x = intersect, fill = tissueType)) +
+    geom_bar(width = 0.8) +
+    scale_fill_manual(values = c(tumor = "orange",normal = "lightgreen")) +
+    ylab("Inclusive intersection of sampleIDs") +
+    xlab(NULL) +
+    theme_bw() +
+    theme(
+        axis.text.x = element_blank(),
+        axis.ticks.x = element_blank()
+    ) +
+    scale_y_continuous(
+        breaks = seq(0, 1000, by = 200)
+    )
+
+# Bottom Plot
+p_bottom <-
+    ggplot(intersectionCombinations,
+           aes(combination, entry)) +
+    geom_line(aes(group = combination), linewidth = 0.5) +
+    geom_point(size = 3) +
+    theme_bw() +
+    theme(
+        axis.title = element_blank(),
+        axis.text.x = element_blank(),
+        axis.ticks.x = element_blank()
+    )
+
+# Stack both Plots:
+p_top / p_bottom +
+    plot_layout(heights = c(3, 1))
+
+
+# CLean up workspace
+rm(allPatientIDs, upset_df, omicsToUse, combinations, intersections, intersectionCombinations, p_top, p_bottom)
+
+# Check the numbers for single modality:
+# table(intersections[intersections$intersect=="RNA","tissueType"])
+
+# Check the numbers for multiple modalities:
+# unique(intersections$intersect) # Modality combinations
+# table(intersections[intersections$intersect=="RNA&Methylation&Phenotype&Survival","tissueType"]) # Tumor vs Normal numbers
+
+
+```
+
+Copy Number Variations are determined by comparing the gene copy numbers
+of the tumor tissue against normal tissue, therefore no normal tissue
+samples are available (as the variations would all be 0). The same is
+true for the Somatic Mutations (SNPs and INDELs).\
+Therefore any combination of omics layers containing either will not be
+including normal tissue samples as there is no overlap.
+
+The chosen combination of Survival + RNAseq + Phenotype + Methylation
+yields an intersect of 319 tumor and 24 normal sampleIDs.
+
+
+## 1.3 QC of Data
+
+The TCGA datasets are highly curated and datasets should be normalized, however just in case double-checking is prudent.
+
+Note that PCA and hierarchical clustering are performed as part of the exploratory data analysis (EDA) in a separate script.
+
+### 1.3.1 RNAseq QC
+
+The RNAseq data for TCGA kidney renal clear cell carcinoma (KIRC) contains whole-genome gene expression using the llumina HiSeq RNASeq V2 platform.
+
+The gene expression profile was measured experimentally using the Illumina HiSeq 2000 RNA Sequencing platform by the University of North Carolina TCGA genome characterization center. Level 3 data was downloaded from TCGA data coordination center. This dataset shows the gene-level transcription estimates, as in log2(x+1) transformed RSEM normalized count. Genes are mapped onto the human genome coordinates using UCSC Xena HUGO probeMap.
+
+The explanation is based on the information supplied by the University of California Santa Cruz and their XenaBrowser for the TCGA dataset: https://xenabrowser.net/datapages/?dataset=TCGA.KIRC.sampleMap%252FHiSeqV2
+
+#### 1.3.1.1 Expression Distribution Plot
+
+```{r, RNAseq Expression Distribution}
+# Boxplot of data to check distributions
+boxplot(RNAseq_mat[,-1],
+        outline = FALSE,
+        xaxt = "n",
+        col = "lightblue",
+        ylab = "log2(normalized count + 1)",
+        xlab = "Samples",
+        main = "RNAseq: Expression distributions across samples")
+
+```
+
+While the sample distributions are not as uniform as with quantile normalization, overall the expression distributions across samples exhibit very similar medians and upper / lower quartiles.
+
+#### 1.3.1.2 Density Plot
+
+```{r, RNAseq Density Plots}
+# Define different colors for the lines
+cols <- colorRampPalette(brewer.pal(8,"Dark2"))(ncol(RNAseq_mat)-1)
+
+# Plot sample densities. Skip column 1 as it's sampleIDs
+plot(density(unlist(RNAseq_mat[,2])),
+     col=cols[1],
+     lwd=1,
+     ylim=c(0,0.2),
+     main="RNAseq: Density of expression values",
+     xlab="log2(normalized count + 1)")
+
+for(i in 3:(ncol(RNAseq_mat)-1)){
+    lines(density(unlist(RNAseq_mat[,i])),
+          col=cols[i-1],
+          lwd=1)
+}
+
+# Clean up workspace
+rm(cols, i)
+```
+
+As with the expression distributions, overall the density distributions show very similar profiles with few deviations, and even those only in the lower counts. Nonetheless the samples deviating from the main line may warrant a closer look.
+
+#### 1.3.1.3 Relative Log Expression (RLE) Plot
+
+```{r, RNAseq Relative Log Expression (RLE)}
+med <- rowMedians(as.matrix(RNAseq_mat[,-1]))
+rle <- sweep(RNAseq_mat[,-1], 1, med)
+
+boxplot(rle,
+        outline = FALSE,
+        xaxt = "n",
+        xlab = "Samples",
+        ylab = "Relative Log Expression",
+        main = "RNAseq: RLE plot")
+
+# Clean up workspace
+rm(med,rle)
+```
+
+For a well-normalized dataset we expect the medians for all samples to cluster around 0, and for all samples to display a similar spread. Overall this expected behavior can be observed in the plot as well.
+
+#### 1.3.1.4 Mean-SD-Plot
+
+```{r, RNAseq Mean-SD-Plot}
+meanSdPlot(as.matrix(RNAseq_mat[,-1]))
+
+## Alternative, less-sophisticated mean-sd-plot
+# expr.mean <- rowMeans(RNAseq_mat[,-1],na.rm=T)
+# expr.sd <- apply(RNAseq_mat[,-1],1,sd,na.rm=T)
+# 
+# plot(expr.mean,
+#      expr.sd,
+#      pch=16,
+#      cex=.3,
+#      xlab="Mean expression",
+#      ylab="Standard deviation",
+#      main="RNAseq: Mean-SD relationship")
+#
+## Clean up workspace
+#rm(expr.mean,expr.sd)
+```
+
+As we can see in the Mean-SD-Plot no clear trend for the SD to increase with the mean can be observed.
+
+
+### 1.3.2 Methylation450k QC
+
+The Methylation data for TCGA kidney renal clear cell carcinoma (KIRC) contains DNA methylation profiles generated using the Illumina Infinium HumanMethylation450 platform.
+
+Beta values were derived at the Johns Hopkins University and University of Southern California TCGA genome characterization center. DNA methylation values, described as beta values, are recorded for each array probe in each sample via BeadStudio software. DNA methylation beta values are continuous variables between 0 and 1, representing the ratio of the intensity of the methylated bead type to the combined locus intensity. Thus higher beta values represent higher level of DNA methylation, i.e. hypermethylation and lower beta values represent lower level of DNA methylation, i.e. hypomethylation. [The researchers] observed a bimodal distribution of the beta values from both methylation27 and methylation450 platforms, with two peaks around 0.1 and 0.9 and a relatively flat valley around 0.2-0.8. The bimodal distribution is far more pronounced and balanced in methylation450 than methylation27 platform. In the methylation27 platform, the lower beta peak is much stronger than the higher beta peak, while the two peaks are of similar height in the methylation450 platform. Microarray probes are mapped onto the human genome coordinates using xena probeMap derived from GEO GPL13534 record.
+
+The explanation is based on the information supplied by the University of California Santa Cruz and their XenaBrowser for the TCGA dataset: https://xenabrowser.net/datapages/?dataset=TCGA.KIRC.sampleMap%252FHumanMethylation450
+
+#### 1.3.2.1 Expression Distribution Plot
+
+```{r, Methylation450k Expression Distribution}
+# Boxplot of data to check distributions
+boxplot(Methylation450k_mat[,-1],
+        outline = FALSE,
+        xaxt = "n",
+        col = "lightblue",
+        ylab = "beta value",
+        xlab = "Samples",
+        main = "Methylation450k: Expression distributions across samples")
+```
+
+Similar to the RNAseq data, the Methylation450k data shows some variations in median and box quartiles, but overall aligns quite well over the 888 samples. During the EDA a closer look should be taken at the methylation dataset as several samples' median value differs notably from the average median value.
+
+#### 1.3.2.2 Density Plot
+
+```{r, Methylation450k Density Plots}
+# Define different colors for the lines
+cols <- colorRampPalette(brewer.pal(8,"Dark2"))(ncol(Methylation450k_mat)-1)
+
+# Plot sample densities. Skip column 1 as it's sampleIDs
+plot(density(unlist(Methylation450k_mat[,2]),na.rm=TRUE),
+     col=cols[1],
+     lwd=1,
+     ylim=c(0,5),
+     main="Methylation450k: Density of expression values",
+     xlab="beta value")
+
+#for(i in 3:100){ # Use for testing; all 481 samples take quite long. Feels like non-linear complexity
+for(i in 3:(ncol(Methylation450k_mat)-1)){
+    lines(density(unlist(Methylation450k_mat[,i]),na.rm=TRUE),
+          col=cols[i-1],
+          lwd=1)
+}
+
+# Clean up workspace
+rm(cols,i)
+```
+
+Overall the Methylation density distributions show very similar profiles with few deviations.
+
+#### 1.3.2.3 Relative Log Expression (RLE) Plot
+
+```{r, Methylation450k Relative Log Expression (RLE)}
+med <- rowMedians(as.matrix(Methylation450k_mat[,-1]))
+rle <- sweep(Methylation450k_mat[,-1], 1, med)
+
+boxplot(rle,
+        outline = FALSE,
+        xaxt = "n",
+        xlab = "Samples",
+        ylab = "Relative Log Expression",
+        main = "Methylation450k: RLE plot")
+
+# Clean up workspace
+rm(med,rle)
+```
+
+For a well-normalized dataset we expect the medians for all samples to cluster around 0, and for all samples to display a similar spread. Overall this expected behavior can be observed in the plot as well. A select few samples show significantly higher variance in the RLE than average. As with the Methylation Expression Distribution Plot it is again recommended to take a closer look at the methylation dataset during the EDA phase.
+
+#### 1.3.2.4 Mean-SD-Plot
+
+```{r, Methylation450k Mean-SD-Plot}
+meanSdPlot(as.matrix(Methylation450k_mat[,-1]))
+
+## Alternative, less-sophisticated mean-sd-plot
+# expr.mean <- rowMeans(RNAseq_mat[,-1],na.rm=T)
+# expr.sd <- apply(RNAseq_mat[,-1],1,sd,na.rm=T)
+# 
+# plot(expr.mean,
+#      expr.sd,
+#      pch=16,
+#      cex=.3,
+#      xlab="Mean expression",
+#      ylab="Standard deviation",
+#      main="RNAseq: Mean-SD relationship")
+#
+## Clean up workspace
+#rm(expr.mean,expr.sd)
+```
+
+As we can see in the Mean-SD-Plot no clear trend for the SD to increase with the mean can be observed. The hump-like shape is expected due to the beta value being bounded between 0 and 1 and the greatest variance can be observed around beta=0.5.
+
+- CpGs with beta ~ 0 (almost always unmethylated) have little room to vary, so their SD is low.
+- CpGs with beta ~ 1 (almost always methylated) also have little room to vary, so their SD is low.
+- CpGs around beta ~ 0.5 have the greatest possible variability, so their SD is highest.
+
+
+### 1.3.3 GISTIC2 Thresholded Gene-Level Copy Number Variations QC
+
+The CNV data for TCGA kidney renal clear cell carcinoma (KIRC) contains gene-level copy number variations generated using the TCGA FIREHOSE pipeline.
+
+Copy number profile was measured experimentally using whole genome microarray at a TCGA genome characterization center. Subsequently, GISTIC2 method was applied using the TCGA FIREHOSE pipeline to produce gene-level copy number estimates. GISTIC2 further thresholded the estimated values to -2,-1,0,1,2, representing homozygous deletion, single copy deletion, diploid normal copy, low-level copy number amplification, or high-level copy number amplification. Genes are mapped onto the human genome coordinates using UCSC xena HUGO probeMap. Reference to GISTIC2 method PMID:21527027.
+
+The explanation is based on the information supplied by the University of California Santa Cruz and their XenaBrowser for the TCGA dataset: https://xenabrowser.net/datapages/?dataset=TCGA.KIRC.sampleMap%252FGistic2_CopyNumber_Gistic2_all_thresholded.by_genes
+
+#### 1.3.3.1 CNV Data Integrity
+
+```{r, CNV Data Integrity}
+table(as.matrix(GeneLevelCopyNumberThresholded_mat[,-1]))
+```
+
+As the CNV were thresholded we only expect the values -2, -1, 0, 1 and 2 which we indeed observe.
+
+#### 1.3.3.2 CNV Data Missingness
+
+```{r, CNV Data Missingness}
+mean(is.na(GeneLevelCopyNumberThresholded_mat[,-1]))
+any(colMeans(is.na(GeneLevelCopyNumberThresholded_mat[,-1])))
+any(rowMeans(is.na(GeneLevelCopyNumberThresholded_mat[,-1])))
+```
+
+The dataset contains no missing values.
+
+
+#### 1.3.3.3 CNV Fraction of Altered Genes
+
+```{r, CNV Fraction of Altered Genes}
+# Identify genes which gained or lost copies
+genesAltered <- GeneLevelCopyNumberThresholded_mat[,-1] != 0
+
+# Define fraction of genes altered, i.e. how many percent of genes were altered in each sample
+genesAlteredFraction <- colMeans(genesAltered)
+
+# Plot histogram of the fraction of altered genes
+hist(genesAlteredFraction,
+     breaks=40,
+     main = "Copy Number Variations",
+     xlab="Fraction altered genes")
+
+# Plot the distribution in form of a boxplot
+boxplot(genesAlteredFraction,
+        ylab="Fraction altered genes",
+        main="Distribution of fraction of altered genes over all samples")
+
+# Identify which samples show a very high fraction of altered genes
+which(genesAlteredFraction >
+      quantile(genesAlteredFraction, 0.9))
+
+# Clean up workspace
+rm(genesAltered,genesAlteredFraction)
+```
+According to our research, different types of tumors may display different percentages of genes altered with 15-70% common and values outside of this range possible (source: https://academic.oup.com/nar/article/50/7/3673/6563719).  
+
+For the TCGA KIRC dataset quite a few samples show very high fractions of altered genes. These samples may be of interest in further downstream analysis.
+
+
+<!-- Block removed as it would be more suited for EDA instead of simple QC
+#### 1.3.3.4 CNV Heatmap
+
+```{r, CNV Heatmap of CNVs}
+fractions <- rbind(
+    loss2 = colMeans(GeneLevelCopyNumberThresholded_mat[,-1] == -2),
+    loss1 = colMeans(GeneLevelCopyNumberThresholded_mat[,-1] == -1),
+    neutral = colMeans(GeneLevelCopyNumberThresholded_mat[,-1] == 0),
+    gain1 = colMeans(GeneLevelCopyNumberThresholded_mat[,-1] == 1),
+    gain2 = colMeans(GeneLevelCopyNumberThresholded_mat[,-1] == 2)
+)
+
+heatmap(fractions)
+
+# Clean up workspace
+rm(fractions)
+``` 
+-->
+
+### 1.3.4 Somatic Mutations (SNPs and INDELs)
+
+The somatic mutation data for TCGA kidney renal clear cell carcinoma (KIRC) contains unified Ensemble "MC3" gene-level mutation calls.  
+
+- 1: non-silent mutation, i.e. missense, nonsense, frameshift, splice, etc.
+- 0: wildtype, i.e. no non-silent or silent-only mutation
+
+The data therefore only contains binary non-silent mutation calls for 40.544 identifiers (genes).
+
+The explanation is based on the information supplied by the University of California Santa Cruz and their XenaBrowser for the TCGA dataset: https://xenabrowser.net/datapages/?dataset=mc3_gene_level%252FKIRC_mc3_gene_level.txt
+
+#### 1.3.4.1 Somatic Mutations Data Integrity
+
+```{r, Somatic Mutations Data Integrity}
+
+#paste0("Check Somatic Mutations Data for values outside of 0 and 1")
+table(as.matrix(SomaticMutationSnpIndel_mat[,-1]))
+
+#paste0("Check Somatic Mutations Data sampleIDs for tissue type by sampleID code.")
+table(str_sub(colnames(SomaticMutationSnpIndel_mat[,-1]), start = -2, end = -1))
+```
+
+No values outside of "0" and "1" were observed.  
+All samples are primary tumor samples (code "01").
+
+
+#### 1.3.4.2 Somatic Mutations Number of Mutations
+
+```{r, Somatic Mutations Number of Mutations}
+
+# Get number of mutations per sample
+mutationNumbers <- colSums(SomaticMutationSnpIndel_mat[,-1])
+summary(mutationNumbers)
+
+# Histogram to see the frequencies
+hist(mutationNumbers,
+     breaks = 50,
+     main = "Gene-level non-silent mutations",
+     xlab = "Number of mutated genes")
+
+boxplot(mutationNumbers,
+        ylab="Number of mutated genes",
+        main="Gene-level non-silent mutations")
+
+# Identify outliers based on histogram
+which(mutationNumbers>200)
+
+# Identify samples with no mutations
+which(mutationNumbers==0)
+
+# Identify samples with fery few mutations
+which(mutationNumbers<=10)
+
+# Clean up workspace:
+rm(mutationNumbers)
+```
+
+The samples "TCGA-B0-4698-01" and "TCGA-B0-5098-01" show much higher numbers of mutated genes than the rest of the samples.  
+No primary tumor samples showed no non-silent mutations.  
+
+The samples "TCGA-AK-3443-01", "TCGA-BP-4177-01" and "TCGA-DV-A4VZ-01" show only a small number of non-silent mutations (<=10).  
+Note that as the samples are primary tumors small numbers of non-silent mutations are possible for especially early identified or benign tumors, and very large numbers of non-silent mutations may be possible for especially late stage or aggressive tumors.  
+
+The samples are therefore not to be removed, but should they show especially high or low survival times the number of non-silent mutations may be an indicative factor.
+
+#### 1.3.4.3 Somatic Mutations Gene-Wise Mutation Frequency
+
+```{r, Somatic Mutations Gene-Wise Mutation Frequency}
+
+# Get mutation frequencies for each gene
+geneMutFrequencies <- rowSums(SomaticMutationSnpIndel_mat[,-1]) /
+                  (ncol(SomaticMutationSnpIndel_mat)-1)
+names(geneMutFrequencies) <- SomaticMutationSnpIndel_mat$sample
+
+# Identify 5 most frequently mutated genes
+#head(sort(geneMutFrequencies, decreasing=TRUE),n=5)
+
+# Identify 20 most frequently mutated genes
+topGenes <- sort(geneMutFrequencies,decreasing=TRUE)[1:30]
+
+barplot(topGenes,
+        las=2,
+        main="Most frequently mutated genes",
+        ylab="Frequency")
+
+# Clean up workspace:
+rm(geneMutFrequencies,topGenes)
+```
+The most frequently no-silently mutated genes with their respective mutation frequencies are:  
+
+- VHL, freq = 0.46
+- PBRM1, freq = 0.40
+- TTN, freq = 0.20
+- SETD2, freq = 0.13
+- BAP1, freq = 0.10
+- MTOR, freq = 0.08
+- MUC16, freq = 0.08
+- KDM5C, freq = 0.05
+- DNAH9, freq = 0.05
+- HMCN1, freq = 0.05
+- AHNAK2, freq = 0.05
+- KMT2C, freq = 0.04
+- CSMD3, freq = 0.04
+- FBN2, freq = 0.04
+- XIRP2, freq = 0.04
+- LRP2, freq = 0.04
+- SPEN, freq = 0.04
+- ATM, freq = 0.04
+- PCLO, freq = 0.04
+- DST, freq = 0.04
+- DNAH2, freq = 0.04
+- ANK3, freq = 0.04
+- FLG, freq = 0.04
+- PTEN, freq = 0.04
+- ARID1A, freq = 0.04
+- MUC17, freq = 0.04
+- USH2A, freq = 0.04
+- LRP1B, freq = 0.04
+- ABCA13, freq = 0.03
+- SYNE1, freq = 0.03
+
+The top genes will be checked against the results of the further analysis.
+
+
+#### 1.3.4.4 Somatic Mutations Top Genes Heatmap
+
+```{r, Somatic Mutations Sample Similarity Heatmap and Clustering}
+
+# # This plots the distance matrix, i.e. rows and columns are samples, and each cell is the distance between two samples
+# library(pheatmap)
+# 
+# # Get distance matrix of distances between samples
+# sampleDist <- dist(t(SomaticMutationSnpIndel_mat[,-1]))
+# 
+# # Plot the heatmap
+# pheatmap(as.matrix(sampleDist),
+#          show_rownames=FALSE,
+#          show_colnames=FALSE,
+#          main="Mutation profile similarity")
+# 
+# # Clean up workspace:
+# rm(sampleDist)
+
+# Depending on definition 3-5 clusters can be observed in the Somatic Mutations data.  
+# As the usage of the Somatic Mutations data is a stretch goal for our analysis we take note of this fact, but do not go for a deeper analysis for now.
+
+###########################################
+# Plot the mutation matrix of top 100 highest-frequency mutated genes
+
+# Required additional libraries
+#if (!requireNamespace("BiocManager", quietly = TRUE))
+#    install.packages("BiocManager")
+#BiocManager::install("ComplexHeatmap")
+library(ComplexHeatmap)
+library(circlize)
+library(tibble)
+
+
+# Check for missing sample IDs -> Just 1, can drop it
+#sum(is.na(SomaticMutationSnpIndel_mat$sample))
+
+# Build numeric data matrix with sampleIDs as rownames. Remove the one row with missing sampleID
+mutations_mat <- SomaticMutationSnpIndel_mat %>%
+    filter(!is.na(sample), sample != "") %>%
+    column_to_rownames("sample") %>%
+    as.matrix()
+storage.mode(mutations_mat) <- "numeric"
+
+# Get a subset of the phenotypes we're interested in to use as annotations
+phenoSubset <- Phenotypes_mat %>%
+  select(sampleID, gender, pathologic_stage)
+
+## Match annotation order to mutation matrix columns
+phenoSubset <- phenoSubset %>%
+  filter(sampleID %in% colnames(mutations_mat)) %>%
+  arrange(match(sampleID, colnames(mutations_mat)))
+
+# Build heatmap annotation object
+# Colors chosen from R's basic color palette grDevices::Colors, https://www.nceas.ucsb.edu/sites/default/files/2020-04/colorPaletteCheatsheet.pdf
+
+annotationObj <- HeatmapAnnotation(
+  Gender = phenoSubset$gender,
+  Stage = phenoSubset$pathologic_stage,
+  col = list(
+    Gender = c(
+      MALE = "cyan",
+      FEMALE = "magenta"
+    ),
+    Stage = c(
+      "Stage I" = "gray90",
+      "Stage II" = "gray60",
+      "Stage III" = "gray30",
+      "Stage IV" = "gray0",
+      "[Discrepancy]" = "red"
+    )
+  )
+)
+
+
+# Get top 100 highest-frequency mutated genes as heatmap takes ages otherwise, and only select those
+topGenes <- names(sort(rowSums(mutations_mat), decreasing = TRUE))[1:100]
+mutations_mat_topGenes <- mutations_mat[topGenes, ]
+
+# Plot the actual heatmap
+Heatmap(
+    mutations_mat_topGenes,
+    name = "Mutation",
+    col = c(
+        "0" = "ivory",
+        "1" = "ivory3"
+    ),
+    top_annotation = annotationObj,
+    cluster_columns = TRUE,
+    cluster_rows = TRUE,
+    clustering_distance_columns = function(x)
+        as.dist(1 - cor(x, method = "pearson")),
+    clustering_method_columns = "complete",
+    show_column_names = FALSE,
+    show_row_names = TRUE,
+    row_names_gp = grid::gpar(fontsize = 6)
+)
+
+# # Alternative library and visualization
+# library(proxy)
+# Heatmap(
+#     mutations_mat_topGenes,
+#     cluster_columns = TRUE,
+#     clustering_distance_columns = function(x)
+#         proxy::dist(t(x), method = "Jaccard"),
+#     top_annotation = annotationObj
+# )
+
+# Clean up workspace:
+rm(mutations_mat, phenoSubset, annotationObj, topGenes, mutations_mat_topGenes)
+
+```
+
+Plotting the top 100 most frequently mutated genes (non-silent mutations) and clustering them using Pearson's correlation does not reveal any immediately obvious clustering pattern. Gender and Stages also appear to not cluster together.
+
+
+### 1.3.5 Phenotypes
+
+The phenotypes data for TCGA kidney renal clear cell carcinoma (KIRC) contains the clinical (meta-)data matrix for all the sampleIDs / patients.  
+
+The data matrix contains, but is not limited to, information about:  
+
+- gender
+- pathologic_stage
+- days_to_death
+- days_to_last_followup
+- pathologic_M
+- pathologic_N
+- pathologic_T
+- sample_type
+- sample_type_id
+- tobacco_smoking_history
+- vital_status
+
+The explanation is based on the information supplied by the University of California Santa Cruz and their XenaBrowser for the TCGA dataset: https://xenabrowser.net/datapages/?dataset=TCGA.KIRC.sampleMap%252FKIRC_clinicalMatrix
+
+#### 1.3.5.1 Phenotypes Fraction of Non-NA Data
+
+```{r, Phenotypes Fraction of Non-NA Values, fig.width=10, fig.height=8, dpi=600}
+
+# Calculate Fractions of Non-NA values for each column
+# Assemble into long format with columns "P"
+plotData <- Phenotypes_mat %>%
+  summarise(across(-sampleID, ~mean(is.na(.)))) %>%
+  pivot_longer(
+    everything(),
+    names_to = "Phenotype",
+    values_to = "NA_fraction"
+  ) %>%
+  mutate(`Non-NA` = 1 - NA_fraction) %>%
+  pivot_longer(
+    c(NA_fraction, `Non-NA`),
+    names_to = "Status",
+    values_to = "Fraction"
+  )
+
+# Priority metadata columns which are to be the first columns to be plotted
+priorityCols <- c(
+  "gender",
+  "pathologic_stage",
+  "days_to_death",
+  "days_to_last_followup",
+  "pathologic_M",
+  "pathologic_N",
+  "pathologic_T",
+  "sample_type",
+  "sample_type_id",
+  "tobacco_smoking_history",
+  "vital_status"
+)
+
+# Reorder the plotData such that priorityCols are first
+plotData <- plotData %>%
+  mutate(
+    Phenotype = fct_relevel(Phenotype, priorityCols)
+  )
+
+ggplot(plotData, aes(x = Phenotype, y = Fraction, fill = Status)) +
+  geom_col() +
+  scale_y_continuous(labels = scales::percent) +
+  scale_fill_discrete(labels = c("NA", "Non-NA")) +
+  xlab(NULL) +
+  theme_bw() +
+  theme(
+  axis.text.x = element_text(angle = -60, hjust = 0, vjust = 0.2),
+  plot.margin = margin(t = 5.5, r = 30, b = 5.5, l = 5.5)) # Adjust margins a bit to fit 45 degree text
+
+# Clean up workspace
+rm(plotData,priorityCols)
+```
+
+As can be seen in this plot many of the clinical data columns are very sparse and contain only a small number of non-NA values.
+Clinical data for use in machine learning needs to be carefully selected so as to not lose too many samples due to missing values, or the chosen approach must be robust against missing values (such as MOFA).
+
+
+### 1.3.6 Curated Survival Data
+
+The curated survival data for TCGA kidney renal clear cell carcinoma (KIRC) contains carious survival time metrics for all sampleIDs / patients.  
+
+Specifically recommended metrics include:  
+
+- OS: overall survial
+- PFI: progression-free interval, i.e. time from the patient's initial cancer diagnosis until the first occurrence of tumor progression / regression or death
+- DSS: disease-specific survival, i.e. Cancer-specific mortality / death caused specifically by that cancer
+- DFI: disease-free interval, i.e. Disease recurrence after disease-free status
+
+The data matrix contains additional values / metrics as well.
+
+The explanation is based on the information supplied by the University of California Santa Cruz and their XenaBrowser for the TCGA dataset: https://xenabrowser.net/datapages/?dataset=survival%252FKIRC_survival.txt
+
+#### 1.3.6.1 Curated Survival Data Fraction of Non-NA Data
+
+```{r, Survival Fraction of Non-NA Values, fig.width=10, fig.height=8, dpi=600}
+
+# Calculate Fractions of Non-NA values for each column
+# Assemble into long format with columns "P"
+plotData <- Survival_mat %>%
+  summarise(across(-sampleID, ~mean(is.na(.)))) %>%
+  pivot_longer(
+    everything(),
+    names_to = "Phenotype",
+    values_to = "NA_fraction"
+  ) %>%
+  mutate(`Non-NA` = 1 - NA_fraction) %>%
+  pivot_longer(
+    c(NA_fraction, `Non-NA`),
+    names_to = "Status",
+    values_to = "Fraction"
+  )
+
+ggplot(plotData, aes(x = Phenotype, y = Fraction, fill = Status)) +
+  geom_col() +
+  scale_y_continuous(labels = scales::percent) +
+  scale_fill_discrete(labels = c("NA", "Non-NA")) +
+  xlab(NULL) +
+  theme_bw() +
+  theme(
+  axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1),
+  plot.margin = margin(t = 5.5, r = 30, b = 5.5, l = 5.5)) # Adjust margins a bit to fit 45 degree text
+
+# Clean up workspace
+rm(plotData)
+```
+
+From the plot we can mostly see three columns with high fractions of missing values:
+
+- DFI: Binary value whether the event occurred
+- DFI.time: Time until the event occurred
+- Redaction
+
+DFI is disease-free interval, i.e. the period from the date of diagnosis until the date of the first new tumor progression event subsequent to the determination of a patient’s disease-free status after their initial diagnosis and treatment. Therefore if a patient remains disease-free or is deceased (from non-tumor-related events) there will be no second disease onset. We can then expect a rather high fraction of missing values for DFI and DFI.time. (source: https://pmc.ncbi.nlm.nih.gov/articles/PMC6066282/)
+
+Redaction is a variable indicating whether the sample is to be redacted or not. As we only use the publicly available data by definition all samples must not be redacted and therefore all redaction values are missing.
+
+
+#### 1.3.6.2 Curated Survival Data Integrity
+
+```{r, Data Integrity}
+
+# Samples for which there is no DSS event, but a DSS.time exists
+dat <- Survival_mat[is.na(Survival_mat$DSS) & !is.na(Survival_mat$DSS.time),]
+dat
+
+# Clean up workspace
+rm(dat)
+
+```
+
+As seen in the bar plot showing fractions of NA values, DSS.time shows none yet DSS has a small fraction of NA values.  
+Per definition by TCGA, DSS is the event of death from the diagnosed cancer type, and the event time is from the date of initial diagnosis until the date of death from the disease. The censored time is from the date of initial diagnosis until the date of last contact or until the date of death from another cause.  (source: https://pmc.ncbi.nlm.nih.gov/articles/PMC6066282/)
+
+21 samples have a DSS.time entry, but no DSS event. This may be due to the DSS event being a derived value instead of being clinically tracked for all but 6 of the 33 PANCAN cancers. KIRC is not among those six cancers, therefore discrepancies may be due to the derivation of event and event time.
+
+
+#### 1.3.6.3 Curated Survival Data Survival Times
+
+```{r, Survival Times}
+# Check overall survival time for negative, overly large or otherwise unexpected values
+any(is.na(Survival_mat$OS.time))
+summary(Survival_mat$OS.time)
+sum(Survival_mat$OS.time < 0, na.rm = TRUE)
+
+hist(Survival_mat$OS.time,
+     breaks = 50,
+     main = "Overall Survival Time (OS)",
+     ylab="Frequency",
+     xlab="Survival Time (days)")
+
+boxplot(Survival_mat$OS.time,
+        main = "Overall Survival Time (OS)",
+        ylab="Survival Time (days)")
+```
+
+The overall survival times (OS) contains no missing values, is non-negative and shows a good distribution of values. It appears suitable for training machine models to predict survival times.
+
+
+### 1.3.7 Exon Expression QC
+
+The Exon Expression data for TCGA kidney renal clear cell carcinoma (KIRC) contains whole-genome exon expression using the Illumina HiSeq 2000 RNA Sequencing platform.
+
+This dataset shows the exon-level transcription estimates, as in RPKM values (Reads Per Kilobase of exon model per Million mapped reads). Exons are mapped onto the human genome coordinates using UCSC Xena unc_RNAseq_exon probeMap (see ID/Gene mapping link below for details.
+
+The explanation is based on the information supplied by the University of California Santa Cruz and their XenaBrowser for the TCGA dataset: https://xenabrowser.net/datapages/?dataset=TCGA.KIRC.sampleMap%252FHiSeqV2_exon
+
+#### 1.3.7.1 Exon Expression Distribution Plot
+
+```{r, Exon Expression Distribution}
+# Boxplot of data to check distributions
+boxplot(ExonExpression_mat[,-1],
+        outline = FALSE,
+        xaxt = "n",
+        col = "lightblue",
+        ylab = "log2(RPKM + 1)",
+        xlab = "Samples",
+        main = "Exon: Expression distributions across samples")
+```
+Overall the exon expression distributions across samples appear quite similar with very few outliers. It should be noted that the (raw) exon expression data was used to calculate the gene expression data of section 1.3.1 whose expression distributions (section 1.3.1.1) look notably more uniform, likely due to filtering and aggregation of multiple exons for each gene expression score.
+
+For further downstream analysis the low-expression outliers should be removed.
+
+
+#### 1.3.7.2 Density Plot
+
+```{r, Exon Expression Density Plots}
+# Define different colors for the lines
+cols <- colorRampPalette(brewer.pal(8,"Dark2"))(ncol(ExonExpression_mat)-1)
+
+# Plot sample densities. Skip column 1 as it's sampleIDs
+plot(density(unlist(ExonExpression_mat[,2])),
+     col=cols[1],
+     lwd=1,
+     ylim=c(0,18),
+     main="Exon: Density of expression values",
+     xlab="log2(RPKM + 1)")
+
+for(i in 3:(ncol(ExonExpression_mat)-1)){
+    lines(density(unlist(ExonExpression_mat[,i])),
+          col=cols[i-1],
+          lwd=1)
+}
+
+# Plot sample densities. Skip column 1 as it's sampleIDs
+plot(density(unlist(ExonExpression_mat[,2])),
+     col=cols[1],
+     lwd=1,
+     ylim=c(0,3),
+     main="Exon: Density of expression values",
+     xlab="log2(RPKM + 1)")
+
+for(i in 3:(ncol(ExonExpression_mat)-1)){
+    lines(density(unlist(ExonExpression_mat[,i])),
+          col=cols[i-1],
+          lwd=1)
+}
+
+# Clean up workspace
+rm(cols, i)
+```
+
+Overall the exon expression densities across samples appear quite similar with samples displaying highly increased variance for low read counts. This behavior is expected as exons with few mapped reads inherently appear noisier, and the log2(RPKM+1) normalization further enhances this visually by compressing high-expression exons to appear more similar while having a lower compression effect on low-expression exons.
+
+#### 1.3.7.3 Relative Log Expression (RLE) Plot
+
+```{r, Exon Relative Log Expression (RLE)}
+med <- rowMedians(as.matrix(ExonExpression_mat[,-1]))
+rle <- sweep(ExonExpression_mat[,-1], 1, med)
+
+boxplot(rle,
+        outline = FALSE,
+        xaxt = "n",
+        xlab = "Samples",
+        ylab = "Relative Log Expression",
+        main = "Exon: RLE plot")
+
+# Clean up workspace
+rm(med,rle)
+```
+
+For a well-normalized dataset we expect the medians for all samples to cluster around 0, and for all samples to display a similar spread. Overall this expected behavior can be observed in the plot as well though as seen with the expression distributions and densities more noise and outliers can be observed in the exon data compared to the gene-level data.
+
+#### 1.3.7.4 Mean-SD-Plot
+
+```{r, Exon Expression Mean-SD-Plot}
+meanSdPlot(as.matrix(ExonExpression_mat[,-1]))
+
+# # Alternative, less-sophisticated mean-sd-plot
+# expr.mean <- rowMeans(ExonExpression_mat[,-1],na.rm=T)
+# expr.sd <- apply(ExonExpression_mat[,-1],1,sd,na.rm=T)
+# 
+# plot(expr.mean,
+#      expr.sd,
+#      pch=16,
+#      cex=.3,
+#      xlab="Mean expression",
+#      ylab="Standard deviation",
+#      main="Exon: Mean-SD relationship")
+# 
+# # Clean up workspace
+# rm(expr.mean,expr.sd)
+```
+
+As we can see in the Mean-SD-Plot no clear trend for the SD to increase with the mean can be observed.
+
+### 1.3.8 Protein Expression RPPA
+
+The Protein Expression RPPA data for TCGA kidney renal clear cell carcinoma (KIRC) contains 273 protein expressions captured by reverse phase protein array.
+
+The data was generated and processed at the MD Anderson Cancer Center TCGA proteome characterization center RPPA core.
+
+The explanation is based on the information supplied by the University of California Santa Cruz and their XenaBrowser for the TCGA dataset: https://xenabrowser.net/datapages/?dataset=TCGA.KIRC.sampleMap%252FRPPA
+
+
+#### 1.3.8.1 Missingness
+
+```{r, Protein RPPA Missingness}
+# Missing values per sample (column)
+colSums(is.na(ProteinExpressionRPPA_mat[,-1]))
+
+# Missing values per protein (row)
+rowSums(is.na(ProteinExpressionRPPA_mat[,-1]))
+```
+All samples display either 41 or 55 missing values for proteins.  
+Several proteins display 454 missing values (out of 478 samples) are were apparently only measured for a select small subset of samples. Specifically 177 proteins were measured for all 478 available samples, 55 proteins were measured for 454 samples (24 missing) and 41 proteins were only measured for 24 samples (454 missing).
+
+For downstream analysis imputing the missing values for the 55 proteins over 24 samples is reasonably feasible, however the 41 proteins measured only for 24/478 samples are recommended to be removed from further analysis.
+
+
+#### 1.3.8.2 Protein Expression RPPA Distribution Plot
+
+```{r, Protein Expression RPPA Distribution}
+# Boxplot of data to check distributions
+boxplot(ProteinExpressionRPPA_mat[,-1],
+        outline = FALSE,
+        xaxt = "n",
+        col = "lightblue",
+        ylab = "RPPA value",
+        xlab = "Samples",
+        main = "RPPA: Protein expression distributions across samples")
+```
+
+The RPPA expression distribution shows all sample medians being centered around 0. This is not surprising as the normalization method used for the RPPA data is bidirectional median centering (source: https://tcpa.drbioright.org/rppa500/faq.html). The differences in Q1-Q3-quartiles are not very uniform, but similar enough with the exception of only a small number of samples which might qualify as outliers.
+
+
+#### 1.3.8.3 Density Plot
+
+```{r, RPPA Protein Expression Density Plots}
+# Define different colors for the lines
+cols <- colorRampPalette(brewer.pal(8,"Dark2"))(ncol(ProteinExpressionRPPA_mat)-1)
+
+# Plot sample densities. Skip column 1 as it's sampleIDs
+plot(density(unlist(ProteinExpressionRPPA_mat[,2]),na.rm=T),
+     col=cols[1],
+     lwd=1,
+     ylim=c(0,3.5),
+     main="RPPA: Density of expression values",
+     xlab="Normalized RPPA value")
+
+for(i in 3:(ncol(ProteinExpressionRPPA_mat)-1)){
+    lines(density(unlist(ProteinExpressionRPPA_mat[,i]),na.rm=T),
+          col=cols[i-1],
+          lwd=1)
+}
+
+# Clean up workspace
+rm(cols, i)
+```
+
+Overall the RPPA protein expression densities across samples appear quite similar with samples displaying highly increased variance for low expression counts. This behavior is expected due to the normalization. The samples have been median-centered, therefore many protein expression values are close to 0 and therefore a higher variance around 0 is expected. Additionally with heterogeneous tumors a significant difference in protein expression levels is expected, which will have the highest impact around the center of the distribution.
+
+#### 1.3.8.4 Relative Log Expression (RLE) Plot
+
+```{r, RPPA Protein Expression Relative Log Expression (RLE)}
+med <- rowMedians(as.matrix(ProteinExpressionRPPA_mat[,-1]),na.rm=T)
+rle <- sweep(ProteinExpressionRPPA_mat[,-1], 1, med)
+
+boxplot(rle,
+        outline = FALSE,
+        xaxt = "n",
+        xlab = "Samples",
+        ylab = "Relative Log Expression",
+        main = "RPPA: RLE plot")
+
+# Clean up workspace
+rm(med,rle)
+```
+
+Unsurprisingly given the RPPA data is normalized using bidirectional median centering the RLE plot shows a very similar result to the expression boxplot. Quite similarily the expected clustering of medians around 0 is retained, as is the relatively even range of Q1-Q3-quartile ranges with the exception of a small number of potential outliers which will warrant a closer inspection in downstream analysis.
+
+
+#### 1.3.8.5 Mean-SD-Plot
+
+```{r, RPPA Protein Expression Mean-SD-Plot}
+meanSdPlot(as.matrix(ProteinExpressionRPPA_mat[,-1]))
+
+# # Alternative, less-sophisticated mean-sd-plot
+# expr.mean <- rowMeans(ProteinExpressionRPPA_mat[,-1],na.rm=T)
+# expr.sd <- apply(ProteinExpressionRPPA_mat[,-1],1,sd,na.rm=T)
+# 
+# plot(expr.mean,
+#      expr.sd,
+#      pch=16,
+#      cex=.3,
+#      xlab="Mean expression",
+#      ylab="Standard deviation",
+#      main="RPPA: Mean-SD relationship")
+# 
+# # Clean up workspace
+# rm(expr.mean,expr.sd)
+```
+
+While the low number of proteins limit the informative value of the Mean-SD-Plot the plot nonetheless shows no clear trend for the SD to increase with the mean.
+
+
+### Workspace cleanup
+
+```{r, Clean up workspace}
+# Detach all non-base packages
+pkgs <- setdiff(
+  grep("^package:", search(), value = TRUE),
+  c("package:stats",
+    "package:graphics",
+    "package:grDevices",
+    "package:utils",
+    "package:datasets",
+    "package:methods",
+    "package:base")
+)
+# May not really detach all packages due to dependency order. May need to be done iteratively multiple times, but honestly a bit of a pain
+# Easier to restart the R session instead
+invisible(lapply(rev(pkgs), function(p)
+  try(detach(p, character.only = TRUE, unload = TRUE), silent = TRUE)))
+
+# Unload unnecessary namespaces
+loaded <- loadedNamespaces()
+base_ns <- c(
+  "base", "compiler", "datasets", "graphics", "grDevices",
+  "grid", "methods", "parallel", "splines",
+  "stats", "stats4", "tcltk", "tools", "utils"
+)
+for (ns in setdiff(loaded, base_ns)) {
+  try(unloadNamespace(ns), silent = TRUE)
+}
+
+# Run garbage collection
+gc()
+
+# Remove all files from workspace
+rm(list = ls(envir = .GlobalEnv, all.names = TRUE), envir = .GlobalEnv)
+
+# Delete local RData file to prevent workspace being reloaded
+if (file.exists(".RData"))
+    file.remove(".RData")
+
+# Clear all loaded libraries by restarting the RStudio Session
+if (requireNamespace("rstudioapi", quietly = TRUE) &&
+    rstudioapi::isAvailable()) {
+  rstudioapi::restartSession()
+}
+```

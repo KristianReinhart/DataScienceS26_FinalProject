@@ -1,0 +1,808 @@
+---
+title: "Exploratory Data Analysis — TCGA-KIRC Multi-Omics"
+subtitle: "Multi-Omics Integration for Survival Prediction in Clear Cell Renal Cell Carcinoma"
+author: "Project Group 7 — Danilchyk, Shorzhina, Alves Radtke, Reinhart"
+date: "`r format(Sys.Date(), '%d %B %Y')`"
+output:
+  pdf_document:
+    toc: true
+    toc_depth: '3'
+    latex_engine: xelatex
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    theme: flatly
+    highlight: tango
+    code_folding: show
+    fig_width: 10
+    fig_height: 6
+    df_print: paged
+params:
+  data_dir: "TCGA-KIRC"
+  rna_top_n: 2000          # number of most-variable genes kept for PCA/UMAP
+  meth_top_n: 5000         # number of most-variable CpG probes kept for PCA/UMAP
+  meth_max_na_frac: 0.05   # keep probes with at most this fraction of missing beta; residual NAs imputed
+  meth_sex_dbeta: 0.2      # drop probes whose mean beta differs by > this between sexes (X/Y-probe proxy)
+  min_detect_pct: 80       # flag samples with fewer than this % of genes detected as low-quality
+  seed: 42
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  # Show (foldable) code in HTML, hide it in the PDF report.
+  echo = knitr::is_html_output(),
+  warning = FALSE, message = FALSE,
+  cache     = FALSE,
+  fig.width = 8, fig.height = 5, fig.align = "center", dpi = 120,
+  out.width = "100%"   # scale figures to text width so wide panels don't clip in PDF
+)
+set.seed(params$seed)
+```
+
+# Introduction
+
+This notebook is **Step 1** of our project pipeline: an exploratory data analysis (EDA) of the TCGA Kidney Clear Cell Carcinoma (KIRC) multi-omics cohort, obtained via the UCSC Xena Browser. The goal is to:
+
+1. **Load and inventory** every omics layer and align them by sample.
+2. **Quality-control** each layer separately (value ranges, missingness, per-sample distributions).
+3. **Describe the clinical/survival annotation** we will later predict.
+4. **Look for structure** - tumor vs. normal separation, sample correlation, PCA and UMAP - before any supervised analysis.
+
+Downstream steps (differential expression, MOFA integration, and survival ML) live in separate notebooks. Here we only establish that the data is clean, well-aligned, and carries the biological signal we expect.
+
+> **Scientific question (for context).** Does unsupervised multi-omics integration via
+> MOFA yield latent factors that improve survival prediction in ccRCC, relative to
+> single-omics raw features or a naive concatenation of layers?
+
+## Data layers
+
+Files are tab-separated. In the genomic matrices, **features are rows and samples are columns**; the phenotype/survival tables are **one row per sample**. TCGA barcodes encode the sample type in their 4th field (`-01` primary tumor, `-11` solid-tissue normal, `-05` additional new primary).
+
+| Layer | File | Features | Unit | Xena version |
+|---|---|---|---|---|
+| Gene expression | `RNASeq_Genome.txt` | 20,530 genes | log2(norm_count + 1) | 2017-10-13 |
+| DNA methylation | `Methylation450K.txt` | 485,577 CpG probes | beta value ∈ [0, 1] | 2017-09-08 |
+| Copy number (GISTIC2) | `GeneLevelCopyNumber_Gistic2.txt` | 24,776 genes | GISTIC2 score | — |
+| Curated survival | `PhenotypeCuratedClinicalDataSurvival.txt` | OS/DSS/DFI/PFI (+ time, days) | TCGA-CDR (2018) |
+| Phenotypes | `Phenotypes.txt` | 111 clinical fields | mixed | — |
+
+A few provenance caveats worth carrying forward:
+- **Copy number is exploratory only.** Our modelling plan uses RNA-seq + methylation + survival; GISTIC2 CNV is profiled below for completeness but is not carried into MOFA or the survival models.
+- **Methylation needs technical cleaning** (missing-probe handling and sex-chromosome removal).
+
+```{r libraries}
+suppressPackageStartupMessages({
+  library(data.table)   # fast I/O for the large matrices
+  library(matrixStats)  # rowVars etc. on matrices
+  library(UpSetR)       # cross-layer sample overlap (loads plyr)
+  library(pheatmap)     # sample-correlation heatmap
+  library(corrplot)     # cross-modal PC correlations
+  library(survival)     # Surv(), survfit()
+  library(survminer)    # Kaplan-Meier plots
+  library(umap)         # UMAP embeddings
+  library(ggrepel)      # non-overlapping loading labels
+  library(patchwork)    # compose ggplots
+  library(RColorBrewer)
+  # tidyverse LAST: UpSetR pulls in plyr, whose count()/mutate()/summarise()
+  # would otherwise mask dplyr's. Loading dplyr last keeps dplyr on top.
+  library(tidyverse)
+})
+
+DATA <- params$data_dir
+path <- function(...) file.path(DATA, ...)
+stopifnot(dir.exists(DATA))
+
+# Consistent colours for the recurring sample-type contrast.
+type_cols <- c("Tumor" = "#D7301F", "Normal" = "#2171B5",
+               "AddlPrimary" = "#7A0177")
+```
+
+## Helper: parse TCGA barcodes
+
+The 4th barcode field is the TCGA *sample-type* code. The three that occur in this cohort:
+`01` = primary solid tumor, `11` = solid-tissue normal, and `05` = **additional new primary** - a second, independent primary tumor newly diagnosed in the same patient (not a recurrence and not a metastasis). Only **one** `05` sample exists here and we surface it as `AddlPrimary`.
+
+```{r helper-barcode}
+# TCGA-BP-4162-01  ->  patient = TCGA-BP-4162, type_code = 01
+parse_barcode <- function(x) {
+  parts <- str_split_fixed(x, "-", 4)
+  code  <- substr(parts[, 4], 1, 2)
+  type  <- dplyr::case_when(
+    code == "01" ~ "Tumor",        # primary solid tumor
+    code == "11" ~ "Normal",       # solid-tissue normal
+    code == "05" ~ "AddlPrimary",  # additional new primary (n = 1 here)
+    TRUE         ~ "Other"
+  )
+  tibble(sample = x,
+         patient = paste(parts[, 1], parts[, 2], parts[, 3], sep = "-"),
+         type_code = code, sample_type = type)
+}
+```
+
+# Loading the omics matrices
+
+We read each matrix with `data.table::fread`, then coerce to a numeric matrix with genes / probes as row names and samples as columns.
+
+```{r load-matrix-helper}
+load_matrix <- function(file) {
+  dt <- fread(file, sep = "\t", header = TRUE, showProgress = FALSE)
+  ids <- dt[[1]]
+  m <- as.matrix(dt[, -1])
+  rownames(m) <- ids
+  storage.mode(m) <- "double"
+  m
+}
+```
+
+```{r load-rna}
+rna <- load_matrix(path("HiSeqV2.txt"))
+cat(sprintf("RNA-seq: %d genes x %d samples\n", nrow(rna), ncol(rna)))
+```
+
+```{r load-cnv}
+cnv <- load_matrix(path("Gistic2_CopyNumber_Gistic2_all_data_by_genes.txt"))
+cat(sprintf("Copy number: %d genes x %d samples\n", nrow(cnv), ncol(cnv)))
+```
+
+DNA methylation is large (≈1.4 GB, 485k probes) and about 20 % of probes carry at least one missing beta value. Rather than discarding every probe with any `NA` (complete-case, which drops ~100k probes), we keep probes that are missing in at most `meth_max_na_frac` (`r 100*params$meth_max_na_frac` %) of samples and **mean-impute** the few residual gaps. This retains more informative CpGs while still giving a dense matrix for PCA/MOFA.
+
+```{r load-meth}
+meth_full <- load_matrix(path("HumanMethylation450.txt"))
+na_frac_probe <- rowMeans(is.na(meth_full))
+keep_probe <- na_frac_probe <= params$meth_max_na_frac
+meth <- meth_full[keep_probe, , drop = FALSE]
+rm(meth_full); invisible(gc())
+
+# Mean-impute residual NAs (probe-wise), so the matrix is fully dense.
+n_na <- sum(is.na(meth))
+if (n_na > 0) {
+  na_idx <- which(is.na(meth), arr.ind = TRUE)
+  meth[na_idx] <- rowMeans(meth, na.rm = TRUE)[na_idx[, "row"]]
+}
+cat(sprintf("Methylation: %d/%d probes retained (<= %.0f%% NA) x %d samples; %d cells imputed\n",
+            nrow(meth), length(keep_probe), 100 * params$meth_max_na_frac,
+            ncol(meth), n_na))
+```
+
+```{r load-clinical}
+surv <- fread(path("KIRC_survival.txt"),
+              sep = "\t", header = TRUE, na.strings = c("", "NA"))
+pheno <- fread(path("KIRC_clinicalMatrix.txt"), sep = "\t", header = TRUE,
+               na.strings = c("", "NA"))
+cat(sprintf("Survival: %d samples x %d fields\n", nrow(surv), ncol(surv)))
+cat(sprintf("Phenotypes: %d samples x %d fields\n", nrow(pheno), ncol(pheno)))
+```
+
+# Sample annotation and cross-layer overlap
+
+We build one master annotation table keyed by full barcode, joining sample-type (from the barcode), the clinical variables we care about (grade, stage, age, sex, vital status), and the curated overall-survival endpoint (`OS`, `OS.time`).
+
+```{r sample-info}
+# Sample sets present in each layer.
+layer_samples <- list(
+  RNAseq        = colnames(rna),
+  Methylation   = colnames(meth),
+  CopyNumber    = colnames(cnv),
+  Survival      = surv$sample
+)
+all_samples <- sort(unique(unlist(layer_samples)))
+
+bc <- parse_barcode(all_samples)
+
+clin <- pheno %>%
+  transmute(
+    sample            = sampleID,
+    grade             = na_if(neoplasm_histologic_grade, "GX"),
+    stage             = pathologic_stage,
+    age               = suppressWarnings(as.numeric(age_at_initial_pathologic_diagnosis)),
+    gender            = gender,
+    tss               = tissue_source_site,   # TCGA batch proxy
+    vital_status      = vital_status
+  ) %>%
+  mutate(
+    grade = factor(grade, levels = c("G1", "G2", "G3", "G4")),
+    stage = factor(str_replace(stage, "\\[Discrepancy\\]", NA_character_),
+                   levels = c("Stage I", "Stage II", "Stage III", "Stage IV"))
+  )
+
+surv_small <- surv %>% transmute(sample,
+                                 OS = as.integer(OS),   OS.time  = as.numeric(OS.time),
+                                 PFI = as.integer(PFI), PFI.time = as.numeric(PFI.time))
+
+sample_info <- bc %>%
+  left_join(clin, by = "sample") %>%
+  left_join(surv_small, by = "sample") %>%
+  mutate(
+    in_rna  = sample %in% layer_samples$RNAseq,
+    in_meth = sample %in% layer_samples$Methylation,
+    in_cnv  = sample %in% layer_samples$CopyNumber,
+    in_surv = sample %in% layer_samples$Survival
+  )
+
+knitr::kable(
+  sample_info %>% count(sample_type, name = "n_samples"),
+  caption = "Samples by type across all layers."
+)
+```
+
+## Methylation: remove sex-chromosome signal, build M-values {#meth-clean}
+
+Before any multivariate analysis of the methylation layer we remove **sex-driven probes**. Left in, chrX/chrY probes make *sex* the second-largest axis of global methylation variation, which would surface as a spurious MOFA factor unrelated to the tumour biology we care about. The table below quantifies the problem on the raw matrix; lacking the Illumina 450K chromosome annotation locally, we then use a dependency-free, data-driven proxy to fix it: drop probes whose **mean beta differs by more than `r params$meth_sex_dbeta` between male and female** patients. X/Y probes dominate this set.
+
+We then convert the cleaned beta values to **M-values** (`log2(beta / (1 - beta))`) for the multivariate steps. Beta values are bounded and heteroscedastic; M-values are approximately homoscedastic and are the recommended scale for PCA, clustering and linear models. The raw beta matrix is kept only for the bimodal-distribution QC plot.
+
+**Why the cleaning is necessary.** On the *raw* (sex-probe-containing) matrix, a PCA
+and a UMAP both split the samples into two bands that are present *within both tumour and
+normal tissue* — and those bands are exactly male vs. female. PC1 is the biology we want
+(tumour vs. normal); PC2 (~20 % of variance) is almost entirely sex. The table quantifies it
+(PC2 ~ sex R² ≈ 0.94); the figures below show it. Compare with the PC–covariate heatmap later,
+computed on the *cleaned* matrix, where this association drops to near zero.
+
+```{r meth-sex-before}
+sex_before <- sample_info$gender[match(colnames(meth), sample_info$sample)]
+v0   <- rowVars(meth)
+hvp0 <- names(sort(v0, decreasing = TRUE))[seq_len(min(params$meth_top_n, length(v0)))]
+pca0 <- prcomp(t(meth[hvp0, ]), center = TRUE, scale. = TRUE)
+ve0  <- (pca0$sdev^2 / sum(pca0$sdev^2))[1:5]
+r2_before <- vapply(1:5, function(k) summary(lm(pca0$x[, k] ~ sex_before))$r.squared, numeric(1))
+
+knitr::kable(
+  tibble(PC = paste0("PC", 1:5),
+         `variance %` = round(100 * ve0, 1),
+         `R^2 ~ sex`  = round(r2_before, 3)),
+  caption = "Before cleaning: variance and sex-association of the leading methylation PCs. Sex owns PC2."
+)
+```
+
+```{r meth-before-pca, fig.width=10, fig.height=4}
+sex_cols <- c("MALE" = "#4292C6", "FEMALE" = "#DD3497")
+type_before <- parse_barcode(colnames(meth))$sample_type
+scores0 <- tibble(PC1 = pca0$x[, 1], PC2 = pca0$x[, 2],
+                  sample_type = type_before, sex = sex_before)
+vlab <- function(k) sprintf("PC%d (%.1f%%)", k, 100 * ve0[k])
+
+b1 <- ggplot(scores0, aes(PC1, PC2, colour = sample_type)) +
+  geom_point(size = 1.8, alpha = 0.85) + scale_colour_manual(values = type_cols) +
+  labs(title = "Raw methylation PCA - by sample type", x = vlab(1), y = vlab(2),
+       colour = NULL) + theme_minimal(base_size = 12)
+b2 <- ggplot(scores0, aes(PC1, PC2, colour = sex)) +
+  geom_point(size = 1.8, alpha = 0.85) +
+  scale_colour_manual(values = sex_cols, na.value = "grey85") +
+  labs(title = "Raw methylation PCA - by sex", x = vlab(1), y = vlab(2),
+       colour = "sex") + theme_minimal(base_size = 12)
+b1 | b2
+```
+
+```{r meth-before-umap, fig.width=7, fig.height=5}
+emb0 <- umap(pca0$x[, 1:min(20, ncol(pca0$x))],
+             n_neighbors = 15, min_dist = 0.1, random_state = params$seed)
+tibble(UMAP1 = emb0$layout[, 1], UMAP2 = emb0$layout[, 2], sex = sex_before) %>%
+  ggplot(aes(UMAP1, UMAP2, colour = sex)) +
+  geom_point(size = 1.8, alpha = 0.85) +
+  scale_colour_manual(values = sex_cols, na.value = "grey85") +
+  labs(title = "Raw methylation UMAP - coloured by sex",
+       subtitle = "the two clusters within tumour and within normal are male vs. female",
+       colour = "sex") + theme_minimal(base_size = 12)
+```
+
+```{r meth-clean}
+sex_vec <- sample_info$gender[match(colnames(meth), sample_info$sample)]
+is_m <- !is.na(sex_vec) & sex_vec == "MALE"
+is_f <- !is.na(sex_vec) & sex_vec == "FEMALE"
+
+dbeta <- rowMeans(meth[, is_m, drop = FALSE]) - rowMeans(meth[, is_f, drop = FALSE])
+sex_probe <- abs(dbeta) > params$meth_sex_dbeta
+meth <- meth[!sex_probe, , drop = FALSE]
+
+# Beta -> M-value (clip to avoid infinities at 0/1).
+beta_clip <- pmin(pmax(meth, 1e-4), 1 - 1e-4)
+meth_m <- log2(beta_clip / (1 - beta_clip))
+
+cat(sprintf("Removed %d sex-associated probes (|dbeta| > %.2f); %d probes remain.\n",
+            sum(sex_probe), params$meth_sex_dbeta, nrow(meth)))
+cat(sprintf("Built M-value matrix: %d probes x %d samples.\n", nrow(meth_m), ncol(meth_m)))
+```
+
+## Per-layer counts (tumor vs. normal)
+
+```{r layer-counts}
+layer_type_counts <- imap_dfr(layer_samples, function(s, layer) {
+  parse_barcode(s) %>% count(sample_type) %>% mutate(layer = layer)
+})
+
+ggplot(layer_type_counts, aes(layer, n, fill = sample_type)) +
+  geom_col(position = position_dodge(preserve = "single")) +
+  geom_text(aes(label = n), position = position_dodge(width = 0.9),
+            vjust = -0.3, size = 3) +
+  scale_fill_manual(values = type_cols, name = "Sample type") +
+  labs(title = "Sample counts per omics layer", x = NULL, y = "Samples") +
+  theme_minimal(base_size = 12)
+```
+
+## Cross-layer overlap (UpSet)
+
+The integration analyses require samples measured on *all* of the layers we intend to use. Restricting to **primary tumor** samples, the UpSet plot below quantifies the overlap; the intersection of RNA-seq ∩ Methylation ∩ Survival is our working cohort.
+
+```{r upset, fig.width=9, fig.height=5}
+tumor_of <- function(s) {
+  bc <- parse_barcode(s); bc$sample[bc$sample_type == "Tumor"]
+}
+tumor_sets <- lapply(layer_samples, tumor_of)
+
+upset(fromList(tumor_sets), order.by = "freq", nsets = length(tumor_sets),
+      sets.bar.color = c("#3C5488", "#00A087", "#7E6148", "#E64B35"), 
+      main.bar.color = "#333333",
+      mainbar.y.label = "Primary-tumor samples in intersection",
+      sets.x.label = "Samples per layer")
+
+common_ml <- Reduce(intersect, list(tumor_sets$RNAseq, tumor_sets$Methylation,
+                                     tumor_sets$Survival))
+cat(sprintf("Primary tumors with RNA + Methylation + Survival: %d\n", length(common_ml)))
+cat(sprintf("...also with Copy number: %d\n",
+            length(intersect(common_ml, tumor_sets$CopyNumber))))
+```
+
+One-sample-per-patient is a hard requirement for the survival models: two samples from the same patient landing in different cross-validation folds would leak information. We verify the working cohort has no duplicated patients.
+
+```{r leakage-check}
+cohort_patients <- parse_barcode(common_ml)$patient
+dup <- cohort_patients[duplicated(cohort_patients)]
+cat(sprintf("Working cohort: %d samples, %d unique patients, %d duplicated patient(s).\n",
+            length(common_ml), length(unique(cohort_patients)), length(unique(dup))))
+if (length(dup) == 0) {
+  cat("OK - one sample per patient; safe for stratified cross-validation.\n")
+} else {
+  cat("WARNING - deduplicate before modelling. Duplicated patients:\n")
+  print(unique(dup))
+}
+```
+
+# Clinical and survival exploration
+
+Before touching the omics, we characterise the outcome we will model.
+
+```{r clinical-distributions, fig.width=10, fig.height=7}
+tumor_info <- sample_info %>% filter(sample_type == "Tumor")
+
+p_grade <- ggplot(tumor_info %>% filter(!is.na(grade)), aes(grade, fill = grade)) +
+  geom_bar() + scale_fill_brewer(palette = "OrRd", guide = "none") +
+  labs(title = "Histologic grade", x = NULL, y = "Patients") + theme_minimal()
+
+p_stage <- ggplot(tumor_info %>% filter(!is.na(stage)), aes(stage, fill = stage)) +
+  geom_bar() + scale_fill_brewer(palette = "PuBu", guide = "none") +
+  labs(title = "Pathologic stage", x = NULL, y = "Patients") +
+  theme_minimal() + theme(axis.text.x = element_text(angle = 30, hjust = 1))
+
+p_age <- ggplot(tumor_info %>% filter(!is.na(age)), aes(age)) +
+  geom_histogram(binwidth = 5, fill = "#41AB5D", colour = "white") +
+  labs(title = "Age at diagnosis", x = "Years", y = "Patients") + theme_minimal()
+
+p_sex <- ggplot(tumor_info %>% filter(!is.na(gender)), aes(gender, fill = gender)) +
+  geom_bar() + scale_fill_manual(values = c("MALE" = "#4292C6", "FEMALE" = "#DD3497"),
+                                 guide = "none") +
+  labs(title = "Sex", x = NULL, y = "Patients") + theme_minimal()
+
+(p_grade | p_stage) / (p_age | p_sex)
+```
+
+## Overall-survival availability
+
+```{r os-summary}
+os_tab <- tumor_info %>%
+  summarise(
+    n = n(),
+    with_OS      = sum(!is.na(OS) & !is.na(OS.time)),
+    events_death = sum(OS == 1, na.rm = TRUE),
+    censored     = sum(OS == 0, na.rm = TRUE),
+    median_fu_days = median(OS.time[OS == 0], na.rm = TRUE)
+  )
+knitr::kable(os_tab, caption = "Overall-survival endpoint summary (primary tumors).")
+```
+
+## Kaplan–Meier curves
+
+Overall survival for the whole cohort, then stratified by stage and by grade — a first check that the clinical variables carry prognostic signal (they should: stage/grade are the standard ccRCC prognosticators).
+
+**Endpoint choice.** We model **overall survival (OS)** as the primary endpoint: for KIRC it has the most events and is the most widely reported, which keeps our results comparable with the literature. The TCGA-CDR curators note that progression-free interval (PFI) can be more reliable when follow-up is short, so we also show PFI by stage as a robustness check; DFI/DSS are sparser here and are left for sensitivity analysis.
+
+```{r km-palettes}
+stage_pal <- c("#6BAED6", "#3182BD", "#08519C", "#08306B")  # 4 stages, all visible
+grade_pal <- c("#FDAE6B", "#F16913", "#D94801", "#7F2704")  # 4 grades
+```
+
+```{r km-overall, fig.width=7, fig.height=5}
+km_df <- tumor_info %>% filter(!is.na(OS), !is.na(OS.time), OS.time > 0)
+
+fit_all <- survfit(Surv(OS.time, OS) ~ 1, data = km_df)
+ggsurvplot(fit_all, data = km_df, conf.int = TRUE, risk.table = TRUE,
+           xlab = "Days", ylab = "Overall survival",
+           title = "Overall survival - full ccRCC cohort",
+           palette = "#D7301F")
+```
+
+```{r km-by-stage, fig.width=8, fig.height=6}
+fit_stage <- survfit(Surv(OS.time, OS) ~ stage, data = km_df %>% filter(!is.na(stage)))
+ggsurvplot(fit_stage, data = km_df %>% filter(!is.na(stage)),
+           conf.int = FALSE, risk.table = TRUE, pval = TRUE,
+           legend.title = "Stage", xlab = "Days", ylab = "Overall survival",
+           title = "Overall survival by pathologic stage",
+           palette = stage_pal)
+```
+
+```{r km-by-grade, fig.width=8, fig.height=6}
+fit_grade <- survfit(Surv(OS.time, OS) ~ grade, data = km_df %>% filter(!is.na(grade)))
+ggsurvplot(fit_grade, data = km_df %>% filter(!is.na(grade)),
+           conf.int = FALSE, risk.table = TRUE, pval = TRUE,
+           legend.title = "Grade", xlab = "Days", ylab = "Overall survival",
+           title = "Overall survival by histologic grade",
+           palette = grade_pal)
+```
+
+```{r km-pfi-by-stage, fig.width=8, fig.height=6}
+pfi_df <- tumor_info %>% filter(!is.na(PFI), !is.na(PFI.time), PFI.time > 0, !is.na(stage))
+fit_pfi <- survfit(Surv(PFI.time, PFI) ~ stage, data = pfi_df)
+ggsurvplot(fit_pfi, data = pfi_df,
+           conf.int = FALSE, risk.table = TRUE, pval = TRUE,
+           legend.title = "Stage", xlab = "Days", ylab = "Progression-free interval",
+           title = "Progression-free interval by pathologic stage (robustness check)",
+           palette = stage_pal)
+```
+
+# Per-layer quality control
+
+## RNA-seq
+
+The data are already log2(norm_count + 1). We check per-sample distributions (looking for outlier samples), the fraction of undetected genes per sample, and the global value range.
+
+```{r rna-qc, fig.width=9, fig.height=4}
+rna_type <- parse_barcode(colnames(rna))$sample_type
+
+# Per-sample summaries (median expression, % detected genes).
+rna_sample_qc <- tibble(
+  sample      = colnames(rna),
+  type        = rna_type,
+  median_expr = colMedians(rna),
+  pct_detected = colMeans(rna > 0) * 100
+)
+
+q1 <- ggplot(rna_sample_qc, aes(type, median_expr, fill = type)) +
+  geom_boxplot(outlier.size = 0.6) + scale_fill_manual(values = type_cols, guide = "none") +
+  labs(title = "Median expression per sample", x = NULL, y = "log2(count+1)") +
+  theme_minimal()
+
+q2 <- ggplot(rna_sample_qc, aes(type, pct_detected, fill = type)) +
+  geom_boxplot(outlier.size = 0.6) + scale_fill_manual(values = type_cols, guide = "none") +
+  geom_hline(yintercept = params$min_detect_pct, linetype = "dashed", colour = "grey40") +
+  labs(title = "% genes detected (>0) per sample", x = NULL, y = "%") +
+  theme_minimal()
+
+q1 | q2
+```
+
+Samples below the `r params$min_detect_pct` % detection threshold (dashed line) are flagged
+as candidate low-quality. We keep them in the EDA for transparency but list them here so the
+modelling notebook can decide whether to exclude them.
+
+```{r rna-lowqual}
+low_q <- rna_sample_qc %>%
+  filter(pct_detected < params$min_detect_pct) %>%
+  arrange(pct_detected) %>%
+  mutate(median_expr = round(median_expr, 2), pct_detected = round(pct_detected, 1))
+cat(sprintf("%d sample(s) below %d%% gene detection.\n",
+            nrow(low_q), params$min_detect_pct))
+if (nrow(low_q) > 0) knitr::kable(low_q, caption = "Candidate low-quality RNA-seq samples.")
+```
+
+```{r rna-density, fig.width=8, fig.height=4}
+# Value density on a random subset of samples to keep the plot readable.
+set.seed(params$seed)
+sub <- sample(seq_len(ncol(rna)), min(40, ncol(rna)))
+rna_long <- as.data.frame(rna[sample(nrow(rna), 4000), sub]) %>%
+  rownames_to_column("gene") %>%
+  pivot_longer(-gene, names_to = "sample", values_to = "expr") %>%
+  mutate(type = parse_barcode(sample)$sample_type)
+
+ggplot(rna_long, aes(expr, group = sample, colour = type)) +
+  geom_density(alpha = 0.3, linewidth = 0.3) +
+  scale_colour_manual(values = type_cols, name = "Sample type") +
+  labs(title = "RNA-seq value distribution (40 random samples)",
+       x = "log2(count+1)", y = "Density") + theme_minimal()
+```
+
+## DNA methylation
+
+Beta values should show the characteristic **bimodal** distribution (peaks near 0 and 1). We confirm this on the cleaned beta matrix (complete/imputed probes, sex-associated probes removed). Density is shown on the natural beta scale, which is the right scale for judging this bimodal QC signature even though the multivariate steps use M-values.
+
+```{r meth-density, fig.width=8, fig.height=4}
+set.seed(params$seed)
+sub_m <- sample(seq_len(ncol(meth)), min(30, ncol(meth)))
+meth_long <- as.data.frame(meth[sample(nrow(meth), 5000), sub_m]) %>%
+  pivot_longer(everything(), names_to = "sample", values_to = "beta") %>%
+  mutate(type = parse_barcode(sample)$sample_type)
+
+ggplot(meth_long, aes(beta, group = sample, colour = type)) +
+  geom_density(linewidth = 0.3) +
+  scale_colour_manual(values = type_cols, name = "Sample type") +
+  labs(title = "DNA methylation beta-value distribution (30 random samples)",
+       subtitle = "Expected bimodal shape: hypo- (~0) and hyper-methylated (~1)",
+       x = "Beta value", y = "Density") + theme_minimal()
+```
+
+```{r meth-na-summary}
+knitr::kable(
+  tibble(metric = c("Probes retained (post NA-filter, imputation, sex removal)",
+                    "Samples", "Global mean beta", "Global median beta"),
+         value = c(nrow(meth), ncol(meth),
+                   round(mean(meth), 3), round(median(meth), 3))),
+  caption = "Cleaned methylation matrix used downstream."
+)
+```
+
+## Copy number (GISTIC2)
+
+```{r cnv-qc, fig.width=8, fig.height=4}
+cnv_long <- as.data.frame(cnv[sample(nrow(cnv), 5000), sample(ncol(cnv), min(40, ncol(cnv)))]) %>%
+  pivot_longer(everything(), names_to = "sample", values_to = "gistic")
+
+ggplot(cnv_long, aes(gistic)) +
+  geom_histogram(bins = 60, fill = "#7A0177", colour = "white") +
+  labs(title = "GISTIC2 copy-number score distribution",
+       x = "GISTIC2 score", y = "Count") + theme_minimal()
+```
+
+# Highly variable features
+
+For unsupervised structure we work with the most variable features in each layer (variance
+across samples is the standard, model-free filter).
+
+```{r hvf}
+top_var_rows <- function(m, n) {
+  v <- rowVars(m, na.rm = TRUE)
+  names(sort(v, decreasing = TRUE))[seq_len(min(n, length(v)))]
+}
+
+rna_hvg  <- top_var_rows(rna,    params$rna_top_n)
+meth_hvp <- top_var_rows(meth_m, params$meth_top_n)   # variance on M-values
+
+cat(sprintf("Kept top %d variable genes and top %d variable CpG probes.\n",
+            length(rna_hvg), length(meth_hvp)))
+
+# Variance-rank curve for RNA (where does the signal plateau?).
+rna_var <- sort(rowVars(rna), decreasing = TRUE)
+plot(rna_var, type = "l", log = "x", xlab = "Gene rank (log scale)",
+     ylab = "Variance across samples", main = "RNA-seq variance scree",
+     col = "#D7301F", lwd = 2)
+abline(v = params$rna_top_n, lty = 2, col = "grey40")
+```
+
+# Unsupervised structure
+
+## PCA per layer
+
+PCA on the most variable features, colouring by sample type. Tumor vs. normal is expected to be the dominant axis of variation in both RNA and methylation.
+
+```{r pca-helper}
+run_pca <- function(m, features, samples = colnames(m), scale. = TRUE) {
+  x <- t(m[features, samples, drop = FALSE])   # samples x features
+  pca <- prcomp(x, center = TRUE, scale. = scale.)
+  ve <- (pca$sdev^2) / sum(pca$sdev^2)
+  info <- parse_barcode(rownames(x)) %>%
+    left_join(sample_info %>% select(sample, grade, stage, gender, age, tss),
+              by = "sample")
+  list(scores = as.data.frame(pca$x) %>% bind_cols(info),
+       ve = ve, rotation = pca$rotation)
+}
+
+pca_scatter <- function(pca, colour_by = "sample_type", title = "") {
+  ve <- pca$ve
+  ggplot(pca$scores, aes(PC1, PC2, colour = .data[[colour_by]])) +
+    geom_point(alpha = 0.8, size = 1.8) +
+    labs(title = title,
+         x = sprintf("PC1 (%.1f%%)", 100 * ve[1]),
+         y = sprintf("PC2 (%.1f%%)", 100 * ve[2]), colour = colour_by) +
+    theme_minimal(base_size = 12)
+}
+```
+
+```{r pca-clin-helper}
+# Clinical/technical colouring only makes sense for tumours (stage/grade are tumour
+# properties; normal-tissue rows carry their patient's label, which is misleading). We
+# plot normals as grey context and colour only the tumours.
+pca_scatter_clin <- function(pca, colour_by, title = "") {
+  ve <- pca$ve
+  sc <- pca$scores
+  tum <- sc %>% filter(sample_type == "Tumor", !is.na(.data[[colour_by]]))
+  oth <- sc %>% filter(!(sample %in% tum$sample))
+  ggplot(mapping = aes(PC1, PC2)) +
+    geom_point(data = oth, colour = "grey85", size = 1.4, alpha = 0.6) +
+    geom_point(data = tum, aes(colour = .data[[colour_by]]), size = 1.8, alpha = 0.85) +
+    labs(title = title, subtitle = "tumours coloured; normals shown in grey",
+         x = sprintf("PC1 (%.1f%%)", 100 * ve[1]),
+         y = sprintf("PC2 (%.1f%%)", 100 * ve[2]), colour = colour_by) +
+    theme_minimal(base_size = 12)
+}
+```
+
+```{r pca-rna, fig.width=10, fig.height=4}
+pca_rna <- run_pca(rna, rna_hvg)
+p_rna_type  <- pca_scatter(pca_rna, "sample_type", "RNA-seq PCA") +
+  scale_colour_manual(values = type_cols)
+p_rna_stage <- pca_scatter_clin(pca_rna, "stage", "RNA-seq PCA — by stage")
+p_rna_type | p_rna_stage
+```
+
+Methylation PCA now runs on the **sex-cleaned M-value matrix**. To show the fix worked, the
+right panel colours the same PCA by sex: the previously dominant sex split on PC2 is gone.
+
+```{r pca-meth, fig.width=10, fig.height=4}
+pca_meth <- run_pca(meth_m, meth_hvp)
+p_meth_type <- pca_scatter(pca_meth, "sample_type", "Methylation PCA (M-values)") +
+  scale_colour_manual(values = type_cols)
+p_meth_sex  <- pca_scatter(pca_meth, "gender", "Methylation PCA - by sex (after removal)") +
+  scale_colour_manual(values = c("MALE" = "#4292C6", "FEMALE" = "#DD3497"), na.value = "grey85")
+p_meth_type | p_meth_sex
+```
+
+```{r pca-meth-grade, fig.width=6, fig.height=4}
+pca_scatter_clin(pca_meth, "grade", "Methylation PCA - by grade")
+```
+
+```{r pca-scree, fig.width=8, fig.height=4}
+scree_df <- bind_rows(
+  tibble(PC = 1:10, ve = pca_rna$ve[1:10],  layer = "RNA-seq"),
+  tibble(PC = 1:10, ve = pca_meth$ve[1:10], layer = "Methylation")
+)
+ggplot(scree_df, aes(PC, 100 * ve, colour = layer)) +
+  geom_line() + geom_point() + scale_x_continuous(breaks = 1:10) +
+  labs(title = "Scree plot (first 10 PCs)", x = "Principal component",
+       y = "% variance explained", colour = NULL) + theme_minimal()
+```
+
+## Association of PCs with clinical and technical variables
+
+Rather than eyeballing each colouring, we quantify how much of each leading PC is explained by every covariate (R² from a univariate linear model of the PC on the covariate). This is the systematic way to interpret PCs and to catch confounders: a *technical* variable (sex, tissue-source-site) lighting up a high-variance PC is a warning sign, whereas *biological* variables (sample type, stage, grade) doing so is the signal we want.
+
+```{r pc-assoc, fig.width=10, fig.height=5}
+assoc_r2 <- function(pca, covars, n_pc = 5) {
+  sc <- pca$scores
+  grid <- expand.grid(PC = paste0("PC", 1:n_pc), covar = covars,
+                      stringsAsFactors = FALSE)
+  grid$r2 <- mapply(function(pc, cv) {
+    df <- data.frame(y = sc[[pc]], x = sc[[cv]])
+    df <- df[!is.na(df$x), ]
+    if (length(unique(df$x)) < 2) return(NA_real_)
+    summary(lm(y ~ x, df))$r.squared
+  }, grid$PC, grid$covar)
+  grid$PC <- factor(grid$PC, levels = paste0("PC", 1:n_pc))
+  grid
+}
+
+covars <- c("sample_type", "stage", "grade", "gender", "age", "tss")
+assoc <- bind_rows(
+  assoc_r2(pca_rna,  covars) %>% mutate(layer = "RNA-seq"),
+  assoc_r2(pca_meth, covars) %>% mutate(layer = "Methylation")
+) %>%
+  mutate(kind = ifelse(covar %in% c("gender", "tss"), "technical", "biological"))
+
+ggplot(assoc, aes(covar, PC, fill = r2)) +
+  geom_tile(colour = "white") +
+  geom_text(aes(label = ifelse(is.na(r2), "", sprintf("%.2f", r2))), size = 3) +
+  scale_fill_gradient(low = "#F7FBFF", high = "#08306B", na.value = "grey90",
+                      name = expression(R^2), limits = c(0, 1)) +
+  facet_wrap(~ layer) +
+  labs(title = "Variance in each PC explained by covariate",
+       subtitle = "gender & tss are technical; the rest biological",
+       x = NULL, y = NULL) +
+  theme_minimal(base_size = 11) +
+  theme(axis.text.x = element_text(angle = 30, hjust = 1))
+```
+
+### Top PC1 loadings (RNA-seq)
+
+Genes driving the dominant axis — useful for a first biological sanity check.
+
+```{r pca-loadings, fig.width=7, fig.height=5}
+load1 <- tibble(gene = rownames(pca_rna$rotation),
+                loading = pca_rna$rotation[, "PC1"]) %>%
+  arrange(desc(abs(loading))) %>% slice_head(n = 20) %>%
+  mutate(gene = fct_reorder(gene, loading))
+
+ggplot(load1, aes(loading, gene, fill = loading > 0)) +
+  geom_col() + scale_fill_manual(values = c("#2171B5", "#D7301F"), guide = "none") +
+  labs(title = "Top 20 genes by |PC1 loading| (RNA-seq)",
+       x = "PC1 loading", y = NULL) + theme_minimal()
+```
+
+## UMAP per layer
+
+A non-linear embedding as a complementary view. We run UMAP on the leading PCs (denoised,
+faster) rather than the raw feature matrix.
+
+```{r umap, fig.width=10, fig.height=4}
+run_umap <- function(pca, n_pc = 20) {
+  n_pc <- min(n_pc, ncol(pca$scores) - 0)
+  emb <- umap(as.matrix(pca$scores[, paste0("PC", 1:n_pc)]),
+              n_neighbors = 15, min_dist = 0.1, random_state = params$seed)
+  bind_cols(pca$scores[, c("sample", "sample_type", "grade", "stage")],
+            UMAP1 = emb$layout[, 1], UMAP2 = emb$layout[, 2])
+}
+
+umap_rna  <- run_umap(pca_rna)
+umap_meth <- run_umap(pca_meth)
+
+u1 <- ggplot(umap_rna, aes(UMAP1, UMAP2, colour = sample_type)) +
+  geom_point(size = 1.8, alpha = 0.85) + scale_colour_manual(values = type_cols) +
+  labs(title = "RNA-seq UMAP", colour = NULL) + theme_minimal()
+u2 <- ggplot(umap_meth, aes(UMAP1, UMAP2, colour = sample_type)) +
+  geom_point(size = 1.8, alpha = 0.85) + scale_colour_manual(values = type_cols) +
+  labs(title = "Methylation UMAP", colour = NULL) + theme_minimal()
+u1 | u2
+```
+
+## Sample correlation heatmap (RNA-seq)
+
+Spearman correlation between samples on the most variable genes. Tumor and normal samples should form distinct blocks.
+
+```{r sample-corr, fig.width=8, fig.height=7}
+set.seed(params$seed)
+sel <- sample(colnames(rna), min(80, ncol(rna)))   # subset for a legible heatmap
+cor_mat <- cor(rna[rna_hvg, sel], method = "spearman")
+
+ann <- sample_info %>% filter(sample %in% sel) %>%
+  select(sample, sample_type) %>% column_to_rownames("sample")
+pheatmap(cor_mat,
+         annotation_col = ann, annotation_row = ann,
+         annotation_colors = list(sample_type = type_cols),
+         show_rownames = FALSE, show_colnames = FALSE,
+         main = "Sample–sample Spearman correlation (RNA-seq, top HVGs)")
+```
+
+# Cross-modal overview
+
+Finally, a first glance at whether the two continuous layers *agree*: we correlate the leading principal components of RNA-seq and methylation on their common samples.
+
+There is a subtlety that matters for our question. On **all** common samples, the strongest RNA↔methylation PC correlation is essentially the trivial tumour-vs-normal axis (both PC1s separate tumour from normal), which inflates the apparent cross-modal agreement. But our survival analysis is **tumour-only**, where that axis is absent. We therefore compute the correlation twice - all common samples vs. tumours only - and re-fit the PCA on each subset. The tumour-only panel is the honest indicator of shared structure MOFA can use for survival.
+
+```{r cross-modal, fig.width=11, fig.height=5}
+common     <- intersect(colnames(rna), colnames(meth_m))
+common_tum <- intersect(common, tumor_sets$RNAseq)   # tumour barcodes only
+cat(sprintf("Common RNA/Methylation samples: %d total, %d primary tumours\n",
+            length(common), length(common_tum)))
+
+pc_corr <- function(samples) {
+  rp <- run_pca(rna,    rna_hvg,  samples = samples)$scores
+  mp <- run_pca(meth_m, meth_hvp, samples = samples)$scores
+  rp <- rp[match(samples, rp$sample), paste0("PC", 1:5)]
+  mp <- mp[match(samples, mp$sample), paste0("PC", 1:5)]
+  cc <- cor(rp, mp, method = "pearson")
+  dimnames(cc) <- list(paste0("RNA_PC", 1:5), paste0("Meth_PC", 1:5))
+  cc
+}
+
+par(mfrow = c(1, 2))
+corrplot(pc_corr(common), method = "color", addCoef.col = "black", tl.col = "black",
+         mar = c(0, 0, 2, 0), title = "All common samples (incl. normal)")
+corrplot(pc_corr(common_tum), method = "color", addCoef.col = "black", tl.col = "black",
+         mar = c(0, 0, 2, 0), title = "Primary tumours only")
+par(mfrow = c(1, 1))
+```
+
+# Summary of findings
+
+**Cohort and alignment.** Of the KIRC samples, **`r length(common_ml)` primary tumours** carry RNA-seq, DNA methylation and curated survival simultaneously (313 also have copy number). They come from `r length(common_ml)` distinct patients - the leakage check found no patient contributing two samples - so the cohort is a clean basis for stratified cross-validation in the modelling notebook.
+
+**Data quality.** RNA-seq (already log2-normalised) shows well-aligned per-sample distributions; **6 tumours** fall below the 80 % gene-detection threshold and are flagged (Table 4) rather than silently kept. DNA methylation is cleanly **bimodal** (beta peaks near 0.05 and 0.9). Cleaning reduced the methylation matrix from 485,577 to **390,943 probes** (90,617 removed for excess missingness, 4,017 sex-associated probes removed, ~42k residual gaps mean-imputed). No samples were dropped in any layer.
+
+**Biological signal is strong and correct.** Tumour vs. normal is the dominant axis of variation in both layers (RNA PC1 ≈ 22 %, methylation PC1 ≈ 40 %; mirrored in UMAP). RNA-seq PC1 is anchored by **CA9** - the canonical VHL/HIF-driven ccRCC marker - against normal proximal/distal-tubule genes (SLC9A4, BSND, CLDN8, ATP6V0A4…), exactly the expected contrast. Kaplan–Meier curves separate strongly by pathologic stage and histologic grade for **both OS and PFI** (log-rank p < 0.0001 throughout), so the outcome is prognostically predictable in principle.
+
+**A technical confounder was found and removed.** On the raw methylation matrix, patient **sex** was the second-largest axis of variation (PC2 ~ sex R² ≈ 0.94), driven by X/Y-chromosome probes. After removing sex-associated probes and switching to M-values, sex no longer loads on the leading components (PC2 ~ sex R² ≈ 0.01; PC–covariate heatmap), while the tumour/normal contrast cleanly owns PC1 (R² ≈ 0.67). A weak residual sex signal survives in the minor components (PC4 R² ≈ 0.27, PC5 ≈ 0.19), and tissue-source-site shows only mild association (R² ≈ 0.10 on PC3–PC5) - neither dominates. This matters because these components feed MOFA next.
+
+**Cross-modal structure exists, but only a tumour-side reading is honest.** Across all common samples the leading RNA and methylation PCs correlate strongly (RNA_PC1 ↔ Meth_PC1 = 0.64) - but that is just the tumour-vs-normal axis. Restricted to primary tumours, RNA_PC1 ↔ Meth_PC1 collapses to **0.00**, yet **RNA_PC2 ↔ Meth_PC1 = 0.66**: real shared tumour-level structure is present, simply not on the leading axis.
+```{r session-info}
+sessionInfo()
+# Removes all objects in the current workspace
+rm(list = ls(all.names = TRUE))
+# Frees up memory
+gc() 
+```

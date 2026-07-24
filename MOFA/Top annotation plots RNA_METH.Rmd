@@ -1,0 +1,208 @@
+---
+title: "Annotation_barplot"
+author: "Tilo Alves Radtke 5444028"
+date: "2026-07-14"
+output: html_document
+---
+```{r working directory}
+setwd("D:/Uni/Master/Data Science/Project/Code_local/MOFA")
+```
+
+This code creates barplots of the top significant pathways for RNA and methylation data into mofa_plots\Pathway_Barplots.
+```{r setup}
+
+if (!requireNamespace("BiocManager", quietly = TRUE))
+    install.packages("BiocManager")
+
+pkgs <- c(
+    "dplyr",
+    "ggplot2"
+)
+
+for(pkg in pkgs){
+    if(!requireNamespace(pkg, quietly = TRUE)){
+        BiocManager::install(pkg, ask = TRUE)
+    }
+}
+
+
+library(dplyr)
+library(ggplot2)
+
+
+RNA_FILE  <- "data/MOFA_RNA_Anno/All_Factors_Significant_GO.csv"
+METH_FILE <- "data/MOFA_Methylation_500_Analysis/Significant_missMethyl_GO_FDR_0_05.csv"
+
+OUTDIR <- "mofa_plots/Pathway_Barplots"
+
+dir.create(
+    OUTDIR,
+    showWarnings = FALSE,
+    recursive = TRUE
+)
+
+
+rna <- read.csv(
+    RNA_FILE,
+    stringsAsFactors = FALSE
+)
+
+meth <- read.csv(
+    METH_FILE,
+    stringsAsFactors = FALSE
+)
+
+
+rna$Score <- -log10(rna$p.adjust)
+
+meth$Score <- -log10(meth$FDR)
+
+
+TOP_PATHWAYS_PER_FACTOR <- 5
+
+#RNAseq top significant pathways per factor(if it made the 0.05 FDR cutoff)
+rna_top_annotation <- rna %>%
+    group_by(Factor) %>%
+    slice_min(
+        p.adjust,
+        n = 1,
+        with_ties = FALSE
+    ) %>%
+    ungroup()
+
+rna_top_annotation$Label <- paste0(
+    rna_top_annotation$Factor,
+    " : ",
+    rna_top_annotation$Description
+)
+
+rna_top_annotation <- rna_top_annotation %>%
+    arrange(Score)
+
+rna_top_annotation$Label <- factor(
+    rna_top_annotation$Label,
+    levels = rna_top_annotation$Label
+)
+
+p_rna_top <- ggplot(
+    rna_top_annotation,
+    aes(
+        x = Label,
+        y = Score
+    )
+) +
+    geom_col(fill = "steelblue", color = "black") +
+    coord_flip() +
+    theme_bw() +
+    labs(
+        title = "RNA: Top Annotation per Factor",
+        x = NULL,
+        y = "-log10(FDR)"
+    ) +
+    geom_text(
+        aes(
+            label = sprintf(
+                " "
+            )
+        ),
+        hjust = -0.1,
+        size = 3
+    ) + 
+    theme(
+    axis.text.y = element_text(color = "black", size = 10))
+  
+
+ggsave(
+    file.path(
+        OUTDIR,
+        "RNA_Top_Annotation_Per_Factor.png"
+    ),
+    p_rna_top,
+    width = 12,
+    height = max(6, 0.4 * nrow(rna_top_annotation))
+)
+
+write.csv(
+    rna_top_annotation,
+    file.path(
+        OUTDIR,
+        "RNA_Top_Annotation_Per_Factor.csv"
+    ),
+    row.names = FALSE
+)
+
+#Methylation top significant pathways per factor(if it made the 0.05 FDR cutoff):
+if(exists("meth") && nrow(meth) > 0){
+
+    meth_top_annotation <- meth %>%
+        group_by(Factor) %>%
+        slice_min(
+            FDR,
+            n = 1,
+            with_ties = FALSE
+        ) %>%
+        ungroup()
+
+    meth_top_annotation$Label <- paste0(
+        meth_top_annotation$Factor,
+        " : ",
+        meth_top_annotation$TERM
+    )
+
+    meth_top_annotation <- meth_top_annotation %>%
+        arrange(Score)
+
+    meth_top_annotation$Label <- factor(
+        meth_top_annotation$Label,
+        levels = meth_top_annotation$Label
+    )
+
+    p_meth_top <- ggplot(
+        meth_top_annotation,
+        aes(
+            x = Label,
+            y = Score
+        )
+    ) +
+        geom_col(fill = "steelblue", color = "black") +
+        coord_flip() +
+        theme_bw() +
+        theme(axis.text.y = element_text(color = "black")) +
+        labs(
+            title = "Methylation: Top Annotation per Factor",
+            x = NULL,
+            y = "-log10(FDR)"
+        ) +
+        geom_text(
+            aes(
+                label = sprintf(
+                    " "
+                )
+            ),
+            hjust = -0.1,
+            size = 3,color = "black"
+        )
+
+
+    ggsave(
+        file.path(
+            OUTDIR,
+            "Methylation_Top_Annotation_Per_Factor.png"
+        ),
+       plot = p_meth_top,
+        width = 12,
+        height = max(6, 0.4 * nrow(meth_top_annotation))
+    )
+
+    write.csv(
+        meth_top_annotation,
+        file.path(
+            OUTDIR,
+            "Methylation_Top_Annotation_Per_Factor.csv"
+        ),
+        row.names = FALSE
+    )
+}
+```
+
+

@@ -1,0 +1,260 @@
+---
+title: "TCGA - KIRC Cohort Data Download: Kidney Clear Cell Carcinoma Downloading Data Files"
+author: 'Group 7: Maksim Danilchyk, Sofya Shorzhina, Tilo Alves Radtke, Kristian Reinhart'
+#date: "`r format(Sys.Date(), '%B %d, %Y')`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    theme: flatly
+    highlight: tango
+    code_folding: show
+    fig_width: 10
+    fig_height: 6
+    df_print: paged
+  pdf_document:
+    toc: true
+    toc_depth: '3'
+    latex_engine: xelatex
+editor_options: 
+  markdown: 
+    wrap: 72
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo      = FALSE,
+  message   = FALSE,
+  warning   = FALSE,
+  cache     = FALSE,
+  fig.align = "center"
+)
+```
+
+------------------------------------------------------------------------
+
+# Overview
+
+This script serves to download the TCGA KIRC Cohort data files for a consistent folder structure and file naming.
+
+The TCGA KIRC Dataset can be found on the Xenabrowser webpages hosted by
+the University of Santa Cruz:
+[https://xenabrowser.net/datapages/?cohort=TCGA%20Kidney%20Clear%20Cell%20Carcinoma%20(KIRC)](https://xenabrowser.net/datapages/?cohort=TCGA%20Kidney%20Clear%20Cell%20Carcinoma%20(KIRC)){.uri}
+
+The dataset offers several different modalities, most notably the
+following ones:
+
+- RNAseq gene expression, whole genome, IlluminaHiSeq_RNASeqV2
+  - log2(norm_count+1) transformed, 20.531 identifiers X 606 samples
+  - Download Link:
+    <https://xenabrowser.net/datapages/?dataset=TCGA.KIRC.sampleMap%252FHiSeqV2>
+  - Original Filename: HiSeqV2.gz
+  - Renamed Filename: HiSeqV2.txt
+- Exon expression RNAseq, IlluminaHiSeq_RNASeqV2
+  - log2(norm_count+1) transformed, 239.323 identifiers X 606 samples
+  - Download Link:
+    <https://xenabrowser.net/datapages/?dataset=TCGA.KIRC.sampleMap%252FHiSeqV2_exon>
+  - Original Filename: HiSeqV2_exon.gz
+  - Renamed Filename: HiSeqV2_exon.txt
+- DNA methylation, Illumina Infinium HumanMethylation450
+  - beta value transformed, 485.578 identifiers X 480 samples
+  - Download Link:
+    <https://xenabrowser.net/datapages/?dataset=TCGA.KIRC.sampleMap%252FHumanMethylation450>
+  - Original Filename: HumanMethylation450.gz
+  - Renamed Filename: Methylation450.txt
+- Phenotypes
+  - Clinical metadata such as patient age, sex, diagnosis, etc.; 945
+    samples X 112 identifiers
+  - Download Link:
+    <https://xenabrowser.net/datapages/?dataset=TCGA.KIRC.sampleMap%252FKIRC_clinicalMatrix>
+  - Original Filename: KIRC_clinicalMatrix
+  - Renamed Filename: KIRC_clinicalMatrix.txt
+- Curated Survival Data
+  - Curated survival data including OS: overall survial, PFI:
+    progression-free interval, DSS: disease-specific survival, DFI:
+    disease-free interval; 944 samples X 11 identifiers
+  - Download Link:
+    <https://xenabrowser.net/datapages/?dataset=survival%252FKIRC_survival.txt>
+  - Original Filename: KIRC_survival.txt
+  - Renamed Filename: KIRC_survival.txt
+- Somatic Mutation (SNP and INDEL) - MC3 gene-level non-silent mutation
+  - binary non-silent mutation call, 40.544 identifiers X 368 samples
+  - Download Link:
+    <https://xenabrowser.net/datapages/?dataset=mc3_gene_level%252FKIRC_mc3_gene_level.txt>
+  - Original Filename: KIRC_mc3_gene_level.txt.gz
+  - Renamed Filename: KIRC_mc3_gene_level.txt
+- Thresholded gene-level Copy Number Variation (CNV), GISTIC2 method
+  - Copy number (gene-level) thresholded to integer values, 24.777
+    identifiers X 528 samples
+  - Download Link:
+    <https://xenabrowser.net/datapages/?dataset=TCGA.KIRC.sampleMap%252FGistic2_CopyNumber_Gistic2_all_thresholded.by_genes>
+  - Original Filename:
+    Gistic2_CopyNumber_Gistic2_all_thresholded.by_genes.gz
+  - Renamed Filename: Gistic2_CopyNumber_Gistic2_all_thresholded.by_genes.txt
+- Protein expression RPPA
+  - Protein expression by reverse phase protein array (RPPA), normalized RPPA value, 274 identifiers X 478 samples
+  - Download Link:
+    <https://xenabrowser.net/datapages/?dataset=TCGA.KIRC.sampleMap%252FRPPA>
+  - Original Filename: RPPA.gz
+  - Renamed Filename: RPPA.txt
+
+Additionally of interest are the codes for encoding the sample type
+(i.e. the type of the sample such as "primary tumor", "normal tissue",
+etc.) whose explanation can be found here:\
+<https://gdc.cancer.gov/resources-tcga-users/tcga-code-tables/sample-type-codes>
+
+As well as a more general overview of the sample code meaning:\
+<https://docs.gdc.cancer.gov/Encyclopedia/pages/TCGA_Barcode/>
+
+
+```{r Loading Libraries}
+# Check/install required package
+if (!requireNamespace("R.utils", quietly = TRUE)) {
+    install.packages("R.utils")
+}
+```
+
+
+```{r Download Helper Function}
+getDataSet <- function(downloadLink,filename,newFilename,downloadDirectory,doUnzip,timeOut=600){
+  # Function to download, extract and rename the necessary dataset files
+  # downloadLink: Link to the file to be donwloaded
+  # filename: Filename of the donwloaded file / archive, including extension. Leave empty ("") if no renaming necessary
+  # newFilename: New filename for the downloaded file. File will be renamed to this. If doUnzip=TRUE renaming is performed on the extracted file.
+  # downloadDirectory: Directory where to download the file to
+  # doUnzip: Logical. TRUE if the downloaded file is an archive to be extracted
+  # timeout: Timeout in seconds for the download. Default is 600 = 10 minutes, should be plenty for the given files
+  tryCatch({
+    # Create directory if it doesn't exist
+    if (!dir.exists(downloadDirectory)) {
+      dir.create(downloadDirectory, recursive = TRUE)
+    }
+    
+    # Define original download filename including filepath
+    downloadPath <- file.path(downloadDirectory, filename)
+    # Define renamed filename including filepath
+    finalPath <- file.path(downloadDirectory, newFilename)
+    
+    options(timeout = timeOut) # Give a download timeout of 10 minutes for the larger files
+    # Download file
+    status <- download.file(
+      downloadLink,
+      destfile = downloadPath,
+      mode = "wb",
+      quiet = TRUE
+    )
+    
+    # Check if download failed, abort if it did
+    if (status!=0) {
+      stop("Download failed.")
+    }
+    
+    # Extract and rename the file if needed
+    if (doUnzip) {
+      R.utils::gunzip(
+        filename = downloadPath,
+        destname = finalPath,
+        remove = FALSE,
+        overwrite = TRUE
+      )
+    } else {
+      # Rename the downloaded file (if no unzipping necessary)
+      if (newFilename!="" && !file.rename(downloadPath, finalPath)) {
+        # Abort if renaming fails for some reason
+        if(newFilename!="") {
+            # Only give warning if need for renaming exists in the first place
+            stop(paste0("Failed to rename downloaded file. Does the file '",downloadPath,"' exist?"))
+        }
+      }
+    }
+    
+    # Delete original compressed / downloaded file
+    if (file.exists(downloadPath) && newFilename!="" && !file.remove(downloadPath)) {
+      warning(paste0("Downloaded file could not be removed. Does the file '",downloadPath,"' exist?"))
+    }
+  }, error = function(e) {
+    # Something unexpected went wrong
+    warning("Downloading / extracting / renaming the dataset from '",downloadLink,"' went wrong somewhere.")
+    message("getDataSet failed: ", conditionMessage(e))
+  })
+}
+```
+
+```{r, Downloading Data}
+# Download, extract and rename the KIRC RNASeq File
+getDataSet(
+    downloadLink="https://tcga-xena-hub.s3.us-east-1.amazonaws.com/download/TCGA.KIRC.sampleMap%2FHiSeqV2.gz",
+    filename="HiSeqV2.gz",
+    newFilename="HiSeqV2.txt",
+    downloadDirectory="TCGA-KIRC",
+    doUnzip=TRUE)
+
+# Download, extract and rename the KIRC Methylation 450k File
+getDataSet(
+    downloadLink="https://tcga-xena-hub.s3.us-east-1.amazonaws.com/download/TCGA.KIRC.sampleMap%2FHumanMethylation450.gz",
+    filename="HumanMethylation450.gz",
+    newFilename="HumanMethylation450.txt",
+    downloadDirectory="TCGA-KIRC",
+    doUnzip=TRUE)
+
+# Download, extract and rename the KIRC Gene Level Copy Number (Thresholded) File
+getDataSet(
+    downloadLink="https://tcga-xena-hub.s3.us-east-1.amazonaws.com/download/TCGA.KIRC.sampleMap%2FGistic2_CopyNumber_Gistic2_all_thresholded.by_genes.gz",
+    filename="Gistic2_CopyNumber_Gistic2_all_thresholded.by_genes.gz",
+    newFilename="Gistic2_CopyNumber_Gistic2_all_thresholded.by_genes.txt",
+    downloadDirectory="TCGA-KIRC",
+    doUnzip=TRUE)
+
+# Download, extract and rename the KIRC Gene Level Copy Number (non-thresholded) File
+getDataSet(
+    downloadLink="https://tcga-xena-hub.s3.us-east-1.amazonaws.com/download/TCGA.KIRC.sampleMap%2FGistic2_CopyNumber_Gistic2_all_data_by_genes.gz",
+    filename="Gistic2_CopyNumber_Gistic2_all_data_by_genes.gz",
+    newFilename="Gistic2_CopyNumber_Gistic2_all_data_by_genes.txt",
+    downloadDirectory="TCGA-KIRC",
+    doUnzip=TRUE)
+
+# Download, extract and rename the KIRC Somatic mutations File
+getDataSet(
+    downloadLink="https://tcga-xena-hub.s3.us-east-1.amazonaws.com/download/mc3_gene_level%2FKIRC_mc3_gene_level.txt.gz",
+    filename="KIRC_mc3_gene_level.txt.gz",
+    newFilename="KIRC_mc3_gene_level.txt",
+    downloadDirectory="TCGA-KIRC",
+    doUnzip=TRUE)
+
+# Download, extract and rename the KIRC Exon expression over whole genome File
+getDataSet(
+    downloadLink="https://tcga-xena-hub.s3.us-east-1.amazonaws.com/download/TCGA.KIRC.sampleMap%2FHiSeqV2_exon.gz",
+    filename="HiSeqV2_exon.gz",
+    newFilename="HiSeqV2_exon.txt",
+    downloadDirectory="TCGA-KIRC",
+    doUnzip=TRUE)
+
+# Download, extract and rename the KIRC Protein Expression RPPA File
+getDataSet(
+    downloadLink="https://tcga-xena-hub.s3.us-east-1.amazonaws.com/download/TCGA.KIRC.sampleMap%2FRPPA.gz",
+    filename="RPPA.gz",
+    newFilename="RPPA.txt",
+    downloadDirectory="TCGA-KIRC",
+    doUnzip=TRUE)
+
+# Download, extract and rename the KIRC Phenotypes File
+getDataSet(
+    downloadLink="https://tcga-xena-hub.s3.us-east-1.amazonaws.com/download/TCGA.KIRC.sampleMap%2FKIRC_clinicalMatrix",
+    filename="KIRC_clinicalMatrix",
+    newFilename="KIRC_clinicalMatrix.txt",
+    downloadDirectory="TCGA-KIRC",
+    doUnzip=FALSE)
+
+# Download, extract and rename the KIRC Curated survival data File
+getDataSet(
+    downloadLink="https://tcga-xena-hub.s3.us-east-1.amazonaws.com/download/survival%2FKIRC_survival.txt",
+    filename="KIRC_survival.txt",
+    newFilename="",
+    downloadDirectory="TCGA-KIRC",
+    doUnzip=FALSE)
+
+# Clean up workspace
+rm(getDataSet)
+```
+

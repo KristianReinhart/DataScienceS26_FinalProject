@@ -1,0 +1,503 @@
+---
+title: "Annotation and Pathways"
+author: "Tilo Alves Radtke 5444028"
+date: "2026-07-10"
+output: html_document
+---
+
+
+
+## R Markdown
+```{r Working directory}
+setwd("D:/Uni/Master/Data Science/Project/Code_local/MOFA")
+```
+
+MOFA Methylation Annotation + Enrichment Analysis Pipeline:
+First we load the packages. The output is muted here, so set echo=TRUE if you encounter issues.
+```{r setup, echo=FALSE}
+
+if (!requireNamespace("BiocManager", quietly = TRUE))
+    install.packages("BiocManager")
+
+packages <- c(
+    "dplyr",
+    "stringr",
+    "tidyr",
+    "readr",
+    "clusterProfiler",
+    "org.Hs.eg.db",
+    "missMethyl",
+    "IlluminaHumanMethylation450kanno.ilmn12.hg19"
+)
+
+for(pkg in packages){
+    if(!requireNamespace(pkg, quietly = TRUE)){
+        BiocManager::install(pkg, ask = TRUE)
+    }
+}
+
+library(dplyr)
+library(stringr)
+library(tidyr)
+library(readr)
+library(clusterProfiler)
+library(org.Hs.eg.db)
+library(missMethyl)
+library(IlluminaHumanMethylation450kanno.ilmn12.hg19)
+```
+Loading the top 500 features list we got from MOFA2, and extract the methylation data.
+```{r}
+
+
+INPUT_FILE <- "data/mofa_top_500_features_per_factor.csv"
+
+TOP_N <- 500
+
+OUTDIR <- "data/MOFA_Methylation_500_Analysis"
+
+dir.create(OUTDIR, showWarnings = FALSE)
+
+
+weights <- read.csv(
+    INPUT_FILE,
+    stringsAsFactors = FALSE
+)
+
+
+meth <- weights %>%
+    filter(View == "Methylation") %>%
+    mutate(
+        CpG_ID = str_remove(Feature_Name, "_meth$")
+    )
+
+cat("Methylation probes:", nrow(meth), "\n")
+```
+We annotate the the 450 methylation data to the original hg19 human genome methylation reference using Illumina, and get Annotated_Methylation_Features.csv as the output.
+```{r}
+
+anno <- getAnnotation(
+    IlluminaHumanMethylation450kanno.ilmn12.hg19
+)
+
+anno <- as.data.frame(anno)
+
+anno$CpG_ID <- rownames(anno)
+
+anno <- anno %>%
+    dplyr::select(
+        CpG_ID,
+        chr,
+        pos,
+        strand,
+        UCSC_RefGene_Name,
+        UCSC_RefGene_Group,
+        Relation_to_Island
+    )
+
+
+meth <- meth %>%
+    left_join(anno, by = "CpG_ID")
+#summary(meth)
+
+clean_field <- function(x){
+
+    if(is.na(x) || x == "")
+        return("")
+
+    vals <- unique(unlist(str_split(x, ";")))
+
+    vals <- vals[vals != ""]
+
+    paste(vals, collapse = ";")
+}
+
+meth <- meth %>%
+    rowwise() %>%
+    mutate(
+        Gene = clean_field(UCSC_RefGene_Name),
+        Gene_Region = clean_field(UCSC_RefGene_Group)
+    ) %>%
+    ungroup()
+
+
+write.csv(
+    meth,
+    file.path(OUTDIR,
+              "Annotated_Methylation_Features.csv"),
+    row.names = FALSE
+)
+```
+
+
+Here we analyse the significance of the CPGs, Positive / Negative Loadings, missMethyl GO enrichment and Gene-based analyses using GO enrichment and KEGG per factor. For our results, we especially used the missMethyl GO enrichment results, and decided based on its FDR, whether a pathway is significantly present in the factor or not on a FDR<0.05 cutoff.
+WARNING: This part takes a while to calculate, not hours but multiple minutes.
+```{r}
+
+all_cpg <- unique(meth$CpG_ID)
+
+
+factors <- unique(meth$Factor)
+
+for(f in factors){
+
+    cat("Calculation of significance of the annotation:", f, "\n")
+
+
+    factor_dir <- file.path(OUTDIR, f)
+
+    dir.create(factor_dir,
+               recursive = TRUE,
+               showWarnings = FALSE)
+
+    
+    # Top CpGs
+    
+
+    top_cpgs <- meth %>%
+        filter(Factor == f) %>%
+        arrange(desc(Absolute_Weight)) %>%
+        slice_head(n = TOP_N)
+
+    write.csv(
+        top_cpgs,
+        file.path(
+            factor_dir,
+            paste0(f, "_TopCpGs.csv")
+        ),
+        row.names = FALSE
+    )
+
+    #We get a lot of files, so we gather the important part into a summary:
+
+    island_summary <- as.data.frame(
+        table(top_cpgs$Relation_to_Island)
+    )
+
+    write.csv(
+        island_summary,
+        file.path(
+            factor_dir,
+            paste0(f,
+                   "_CpG_Island_Distribution.csv")
+        ),
+        row.names = FALSE
+    )
+
+    region_summary <- as.data.frame(
+        table(top_cpgs$Gene_Region)
+    )
+
+    write.csv(
+        region_summary,
+        file.path(
+            factor_dir,
+            paste0(f,
+                   "_GeneRegion_Distribution.csv")
+        ),
+        row.names = FALSE
+    )
+
+    #Separate Positive / Negative Loadings
+
+    positive <- top_cpgs %>%
+        filter(Raw_Weight > 0)
+
+    negative <- top_cpgs %>%
+        filter(Raw_Weight < 0)
+
+    write.csv(
+        positive,
+        file.path(
+            factor_dir,
+            paste0(f, "_PositiveCpGs.csv")
+        ),
+        row.names = FALSE
+    )
+
+    write.csv(
+        negative,
+        file.path(
+            factor_dir,
+            paste0(f, "_NegativeCpGs.csv")
+        ),
+        row.names = FALSE
+    )
+
+
+    #missMethyl GO enrichment
+ 
+
+    sig_cpg <- unique(top_cpgs$CpG_ID)
+
+    if(length(sig_cpg) >= 10){
+
+        cat("Running missMethyl GO...\n")
+
+        go_results <- gometh(
+            sig.cpg = sig_cpg,
+            all.cpg = all_cpg,
+            collection = "GO"
+        )
+
+        write.csv(
+            go_results,
+            file.path(
+                factor_dir,
+                paste0(f,
+                       "_missMethyl_GO.csv")
+            ),
+            row.names = FALSE
+        )
+    }
+
+
+    #Gene-based analyses
+
+
+    genes <- unique(
+        unlist(
+            str_split(
+                paste(top_cpgs$Gene,
+                      collapse = ";"),
+                ";"
+            )
+        )
+    )
+
+    genes <- genes[
+        genes != "" &
+        !is.na(genes)
+    ]
+
+    cat("Genes:", length(genes), "\n")
+
+    if(length(genes) >= 10){
+
+        # GO Enrichment
+        
+        ego <- enrichGO(
+            gene = genes,
+            OrgDb = org.Hs.eg.db,
+            keyType = "SYMBOL",
+            ont = "BP",
+            pAdjustMethod = "BH"
+        )
+
+        if(!is.null(ego)){
+
+            ego_df <- as.data.frame(ego)
+
+            write.csv(
+                ego_df,
+                file.path(
+                    factor_dir,
+                    paste0(f,
+                           "_GO_BP.csv")
+                ),
+                row.names = FALSE
+            )
+        }
+
+        # KEGG
+
+        gene_map <- tryCatch({
+
+            bitr(
+                genes,
+                fromType = "SYMBOL",
+                toType = "ENTREZID",
+                OrgDb = org.Hs.eg.db
+            )
+
+        }, error = function(e) NULL)
+
+        if(!is.null(gene_map)){
+
+            kegg <- enrichKEGG(
+                gene = gene_map$ENTREZID,
+                organism = "hsa"
+            )
+
+            if(!is.null(kegg)){
+
+                kegg_df <- as.data.frame(kegg)
+
+                write.csv(
+                    kegg_df,
+                    file.path(
+                        factor_dir,
+                        paste0(f,
+                               "_KEGG.csv")
+                    ),
+                    row.names = FALSE
+                )
+            }
+        }
+    }
+}
+```
+Now a Summary of all factors is written to data/MOFA_Methylation_500_Analysis/Factor_Summary.csv
+```{r}
+
+summary_table <- meth %>%
+    group_by(Factor) %>%
+    summarise(
+        N_CpGs = n(),
+        Mean_Weight = mean(Absolute_Weight),
+        Median_Weight = median(Absolute_Weight),
+        .groups = "drop"
+    )
+
+write.csv(
+    summary_table,
+    file.path(
+        OUTDIR,
+        "Factor_Summary.csv"
+    ),
+    row.names = FALSE
+)
+
+cat("\nAnalysis complete.\n")
+cat("Results written to:", OUTDIR, "\n")
+```
+
+
+Due to the amount of results, we directly filter by the FDR<0.05(calculated by gometh()), and get out missmethyl values to the file Significant_missMethyl_GO_FDR_0_05.csv, which is the final datatable from the methylation data:
+```{r}
+all_sig_go <- list()
+
+for(f in factors){
+
+    go_file <- file.path(
+        OUTDIR,
+        f,
+        paste0(f, "_missMethyl_GO.csv")
+    )
+
+    if(file.exists(go_file)){
+
+        go_res <- read.csv(
+            go_file,
+            stringsAsFactors = FALSE
+        )
+
+        sig_res <- go_res[
+            go_res$FDR < 0.05,
+        ]
+
+        if(nrow(sig_res) > 0){
+
+            sig_res$Factor <- f
+
+            all_sig_go[[f]] <- sig_res
+        }
+    }
+}
+
+if(length(all_sig_go) > 0){
+
+    significant_GO <- do.call(
+        rbind,
+        all_sig_go
+    )
+
+    # Put Factor as first column
+    significant_GO <- significant_GO[
+        ,
+        c(
+            "Factor",
+            setdiff(
+                colnames(significant_GO),
+                "Factor"
+            )
+        )
+    ]
+
+    write.csv(
+        significant_GO,
+        file.path(
+            OUTDIR,
+            "Significant_missMethyl_GO_FDR_0_05.csv"
+        ),
+        row.names = FALSE
+    )
+
+    cat(
+        "\nFound",
+        nrow(significant_GO),
+        "significant GO terms.\n"
+    )
+
+} else {
+
+    cat(
+        "\nNo missMethyl GO terms with FDR < 0.05 found.\n"
+    )
+}
+
+```
+In this last codeblock, it creates a bubbleplot of the significant pathways per factor. We didnt use it in the presentation due to being not well readable.
+```{r}
+library(dplyr)
+library(ggplot2)
+
+
+meth <- read.csv(
+    "data/MOFA_Methylation_500_Analysis/Significant_missMethyl_GO_FDR_0_05.csv",
+    stringsAsFactors = FALSE
+)
+
+# ============================================================
+# SCORE
+# ============================================================
+
+meth <- meth %>%
+    mutate(
+        Score = -log10(FDR)
+    )
+
+# ============================================================
+# KEEP TOP 10 TERMS PER FACTOR
+# ============================================================
+
+meth_plot <- meth %>%
+    group_by(Factor) %>%
+    arrange(FDR) %>%
+    slice_head(n = 10) %>%
+    ungroup()
+
+# ============================================================
+# BUBBLEPLOT
+# ============================================================
+
+p <- ggplot(
+    meth_plot,
+    aes(
+        x = Factor,
+        y = TERM
+    )
+) +
+    geom_point(
+        aes(
+            size = DE,
+            color = Score
+        )
+    ) +
+    theme_bw() +
+    theme(
+        axis.text.y = element_text(size = 8)
+    ) +
+    labs(
+        title = "Methylation GO Enrichment",
+        size = "Differentially represented genes",
+        color = "-log10(FDR)"
+    )
+
+ggsave(
+    "data/MOFA_Methylation_500_Analysis/Methylation_GO_Bubbleplot.pdf",
+    p,
+    width = 12,
+    height = 10
+)
+
+```
