@@ -1,0 +1,173 @@
+---
+title: "KEGG_RNA"
+author: "Tilo Alves Radtke 5444028"
+date: "2026-07-29"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## R Markdown
+
+
+```{r working directory}
+setwd("D:/Uni/Master/Data Science/Project/Code_local/MOFA")
+```
+
+
+```{r KEGG}
+
+if (!requireNamespace("BiocManager", quietly = TRUE)) {
+  install.packages("BiocManager")
+}
+
+pkgs <- c("dplyr", "clusterProfiler", "org.Hs.eg.db", "AnnotationDbi", "readr")
+
+for (pkg in pkgs) {
+  if (!requireNamespace(pkg, quietly = TRUE)) {
+    BiocManager::install(pkg, ask = TRUE)
+  }
+}
+
+library(dplyr)
+library(clusterProfiler)
+library(org.Hs.eg.db)
+library(AnnotationDbi)
+library(readr)
+
+
+
+INPUT_DIR  <- "data/MOFA_RNA_Anno"
+OUTDIR     <- "data/MOFA_RNA_Anno"
+
+dir.create(OUTDIR, showWarnings = FALSE, recursive = TRUE)
+
+annotated_file <- file.path(INPUT_DIR, "Annotated_RNA_Features.csv")
+
+if (!file.exists(annotated_file)) {
+  stop(paste("Input file not found:", annotated_file, 
+             "\nPlease run RNA_annotation.Rmd first."))
+}
+
+rna_df <- read.csv(annotated_file, stringsAsFactors = FALSE)
+
+factors <- unique(rna_df$Factor)
+cat("Found", length(factors), "factors to process for KEGG analysis.\n\n")
+
+all_kegg_results <- list()
+
+for (f in factors) {
+  
+  cat("--------------------------------------------------\n")
+  cat("Processing KEGG for Factor:", f, "\n")
+  
+  factor_dir <- file.path(OUTDIR, f)
+  dir.create(factor_dir, recursive = TRUE, showWarnings = FALSE)
+  
+  tmp <- rna_df %>%
+    dplyr::filter(Factor == f) %>%
+    dplyr::arrange(desc(abs(Raw_Weight))) %>%
+    dplyr::slice_head(n = 500)
+  
+  genes <- unique(tmp$ENTREZID)
+  genes <- genes[!is.na(genes) & genes != ""]
+  
+  if (length(genes) < 10) {
+    cat("Skipping", f, "- less than 10 valid Entrez IDs found.\n")
+    next
+  }
+  
+  cat("Running enrichKEGG on", length(genes), "genes...\n")
+  
+  kegg_res <- tryCatch({
+    enrichKEGG(
+      gene          = genes,
+      organism      = "hsa",
+      pAdjustMethod = "BH",
+      pvalueCutoff  = 0.05
+    )
+  }, error = function(e) {
+    cat("Error running KEGG for", f, ":", e$message, "\n")
+    return(NULL)
+  })
+  
+  if (is.null(kegg_res)) next
+  
+  kegg_res <- tryCatch({
+    setReadable(kegg_res, OrgDb = org.Hs.eg.db, keyType = "ENTREZID")
+  }, error = function(e) {
+    return(kegg_res)
+  })
+  
+  kegg_df <- as.data.frame(kegg_res)
+  
+  if (nrow(kegg_df) == 0) {
+    cat("No pathways found for", f, "\n")
+    next
+  }
+  
+  kegg_df$Factor <- f
+  
+  write.csv(
+    kegg_df,
+    file.path(factor_dir, paste0(f, "_KEGG_All.csv")),
+    row.names = FALSE
+  )
+  
+  sig_kegg <- kegg_df %>%
+    dplyr::filter(p.adjust < 0.05)
+  
+  if (nrow(sig_kegg) > 0) {
+    cat("Found", nrow(sig_kegg), "significant KEGG pathways (FDR < 0.05).\n")
+    
+    write.csv(
+      sig_kegg,
+      file.path(factor_dir, paste0(f, "_KEGG_Significant.csv")),
+      row.names = FALSE
+    )
+    
+    all_kegg_results[[f]] <- sig_kegg
+  } else {
+    cat("No significant KEGG pathways (FDR < 0.05) found for", f, "\n")
+  }
+}
+
+if (length(all_kegg_results) > 0) {
+  
+  combined_kegg <- dplyr::bind_rows(all_kegg_results)
+  
+  combined_kegg$Score <- -log10(combined_kegg$p.adjust)
+  
+  combined_kegg <- combined_kegg %>%
+    dplyr::select(Factor, ID, Description, GeneRatio, BgRatio, 
+                  pvalue, p.adjust, qvalue, Score, geneID, Count)
+  
+  write.csv(
+    combined_kegg,
+    file.path(OUTDIR, "All_Factors_Significant_KEGG.csv"),
+    row.names = FALSE
+  )
+  
+  top_kegg_per_factor <- combined_kegg %>%
+    dplyr::group_by(Factor) %>%
+    dplyr::slice_min(p.adjust, n = 1, with_ties = FALSE) %>%
+    dplyr::ungroup()
+  
+  write.csv(
+    top_kegg_per_factor,
+    file.path(OUTDIR, "Top_KEGG_Pathway_Per_Factor.csv"),
+    row.names = FALSE
+  )
+  
+  cat("KEGG Analysis Complete!\n")
+  cat("Combined results saved to:", file.path(OUTDIR, "All_Factors_Significant_KEGG.csv"), "\n")
+  cat("Top pathway per factor saved to:", file.path(OUTDIR, "Top_KEGG_Pathway_Per_Factor.csv"), "\n")
+  
+} else {
+  cat("Finished analysis: No KEGG pathways met the FDR < 0.05 cutoff across any factor.\n")
+}
+```
+
+Note that the `echo = FALSE` parameter was added to the code chunk to prevent printing of the R code that generated the plot.
